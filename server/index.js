@@ -1,0 +1,3568 @@
+// server/index.js
+import express from "express";
+import cors from "cors";
+import cookieParser from "cookie-parser";
+import { createServer } from "http";
+import { Server } from "socket.io";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
+import { scoreGuess } from "./game.js";
+import { duelMode, sharedMode, battleMode } from "./modes/index.js";
+import {
+  getOrCreateAnonymousUser,
+  getTodaysPuzzle,
+  getUserDailyResult,
+  createOrUpdateDailyResult,
+  getUserDailyStats,
+  MIN_SKILL_LEADERBOARD_WINS,
+} from "./daily-db.js";
+import {
+  LEADERBOARD_USER_FILTER,
+  decorateLeaderboardRow,
+  decorateLeaderboardRows,
+} from "./leaderboard-utils.js";
+import {
+  normalizePlayerNameInput,
+  persistPlayerDisplayName,
+} from "./player-profile.js";
+import {
+  getPublicCatalog,
+  getProgressionSnapshot,
+  processDailyComplete,
+  processDuelWin,
+  isFirstDailyToday,
+  updateEquippedCosmetics,
+  grantSuperUserProgression,
+} from "./progression/progressionService.js";
+import { setupAuth, getUserIdFromRequest, authenticateSocket } from "./auth.js";
+import { getFullUserProfile } from "./mergeService.js";
+import createAdminEventsRouter from "./admin/events.js";
+import createAdminRouter from "./admin/router.js";
+import {
+  registerEventRuntime,
+  syncActiveEventsOnStartup,
+  tickScheduledEvents,
+} from "./scheduled-events.js";
+import {
+  recordEventMatchCompleted,
+  recordEventParticipationJoin,
+  recordEventParticipationLeave,
+} from "./live-ops-telemetry.js";
+import {
+  sanitizePlayerName,
+  sanitizeRoomId,
+  sanitizeWord,
+  isSafeInput,
+} from "./utils/sanitize.js";
+import helmet from "helmet";
+import * as Sentry from "@sentry/node";
+import { PrismaClient } from "@prisma/client";
+import { config, validateConfig } from "./config/env.js";
+import { startSessionCleanup } from "./jobs/cleanupSessions.js";
+import { startRoomCleanupInterval } from "./jobs/cleanupRooms.js";
+import {
+  getActivePlayerIds,
+  isRoomInProgress,
+  ROOM_ABANDONED_CLOSE_MS,
+} from "./room-lifecycle.js";
+import {
+  apiLimiter,
+  authLimiter,
+  feedbackLimiter,
+  pollingLimiter,
+  checkSocketRateLimit,
+  clearSocketRateLimits,
+} from "./middleware/rateLimiter.js";
+import { submitFeedback } from "./feedback.js";
+import {
+  initRoomStore,
+  getRoom,
+  saveRoom,
+  deleteRoom,
+  listRoomIds,
+  getActiveRoomCount,
+} from "./room-store.js";
+import {
+  DEFAULT_BLOCKLIST_PATH,
+  filterBlockedWords,
+  loadBlocklist,
+} from "./word-blocklist.js";
+
+const prisma = new PrismaClient();
+
+// ---------- Sentry error tracking (optional) ----------
+if (config.sentryDsn) {
+  Sentry.init({
+    dsn: config.sentryDsn,
+    environment: config.sentryEnvironment,
+    tracesSampleRate: config.nodeEnv === "production" ? 0.15 : 1.0,
+  });
+}
+
+// ---------- Validate environment before proceeding ----------
+if (!config.isTest) {
+  try {
+    validateConfig();
+  } catch (error) {
+    console.error("❌ Configuration Error:", error.message);
+    process.exit(1);
+  }
+}
+
+// ---------- Word list loader (.txt) ----------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const WORDLIST_PATH =
+  config.wordlistPath || path.join(__dirname, "words.txt");
+const GUESSES_PATH =
+  config.guessesPath || path.join(__dirname, "allowed_guesses.txt");
+
+let WORD_BLOCKLIST = loadBlocklist(DEFAULT_BLOCKLIST_PATH);
+
+let WORDS = [];
+let WORDSET = new Set();
+let GUESSES = [];
+let GUESSSET = new Set();
+const ROUND_MS = config.duelRoundMs;
+const AI_BATTLE_ROUND_MS = 4 * 60 * 1000;
+const AI_BATTLE_COUNTDOWN_MS = 12 * 1000; // 12 seconds between AI-hosted rounds
+
+async function loadWordFile(filePath) {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Word list file not found: ${filePath}`);
+  }
+  const raw = await fs.promises.readFile(filePath, "utf8");
+  return raw
+    .split(/\r?\n/)
+    .map((w) => w.trim())
+    .filter(Boolean)
+    .map((w) => w.toUpperCase())
+    .filter((w) => /^[A-Z]{5}$/.test(w));
+}
+
+async function loadWords() {
+  WORD_BLOCKLIST = loadBlocklist(DEFAULT_BLOCKLIST_PATH);
+
+  const rawSolutions = await loadWordFile(WORDLIST_PATH);
+  if (rawSolutions.length === 0) {
+    throw new Error(
+      `Word list is empty or contains no valid 5-letter words: ${WORDLIST_PATH}`,
+    );
+  }
+
+  const filteredSolutions = filterBlockedWords(rawSolutions, WORD_BLOCKLIST);
+  if (filteredSolutions.kept.length === 0) {
+    throw new Error(
+      `No solutions remain after blocklist filter (${WORDLIST_PATH})`,
+    );
+  }
+  if (filteredSolutions.removed.length > 0) {
+    console.log(
+      `[words] Blocked ${filteredSolutions.removed.length} solution(s): ${filteredSolutions.removed.slice(0, 12).join(", ")}${filteredSolutions.removed.length > 12 ? "…" : ""}`,
+    );
+  }
+
+  WORDS = Array.from(new Set(filteredSolutions.kept));
+  WORDSET = new Set(WORDS);
+  console.log(`[words] Loaded ${WORDS.length} solutions from ${WORDLIST_PATH}`);
+
+  let guessWords = WORDS;
+  if (fs.existsSync(GUESSES_PATH)) {
+    const rawGuesses = await loadWordFile(GUESSES_PATH);
+    if (rawGuesses.length === 0) {
+      console.warn(
+        `[words] Guess list at ${GUESSES_PATH} is empty; using solution list for validation`,
+      );
+      guessWords = WORDS;
+    } else {
+      const filteredGuesses = filterBlockedWords(rawGuesses, WORD_BLOCKLIST);
+      if (filteredGuesses.removed.length > 0) {
+        console.log(
+          `[words] Blocked ${filteredGuesses.removed.length} guess(es) from allowed list`,
+        );
+      }
+      guessWords = filteredGuesses.kept;
+      console.log(
+        `[words] Loaded ${guessWords.length} allowed guesses from ${GUESSES_PATH}`,
+      );
+    }
+  } else {
+    console.warn(
+      `[words] Guess list not found at ${GUESSES_PATH}; using solution list for validation`,
+    );
+  }
+
+  GUESSES = Array.from(new Set([...guessWords, ...WORDS]));
+  GUESSSET = new Set(GUESSES);
+}
+try {
+  await loadWords();
+} catch (error) {
+  console.error("Failed to load word lists:", error.message);
+  if (!config.isTest) process.exit(1);
+  else throw error;
+}
+
+try {
+  await initRoomStore();
+} catch (error) {
+  console.error("Failed to initialize room store:", error.message);
+  if (!config.isTest) process.exit(1);
+  else throw error;
+}
+
+async function ensureAnonymousSession(req, userId) {
+  if (!req || !req.session || !userId) return;
+  if (req.session.anonymousUserId === userId) return;
+  req.session.anonymousUserId = userId;
+  if (typeof req.session.save !== "function") return;
+  await new Promise((resolve) => {
+    req.session.save((err) => {
+      if (err) {
+        console.warn("[session] Failed to persist anonymous user id", err);
+      }
+      resolve();
+    });
+  });
+}
+
+function readPlayerNameFromRequest(req) {
+  const fromQuery = req.query?.playerName;
+  const fromBody = req.body?.playerName;
+  return normalizePlayerNameInput(fromQuery ?? fromBody);
+}
+
+function syncDisplayNameForUser(userId, rawName) {
+  if (!userId) return Promise.resolve();
+  return persistPlayerDisplayName(prisma, userId, rawName).catch((err) => {
+    console.warn("[profile] Failed to sync display name", userId, err);
+  });
+}
+
+// Helper to pick N unique random words from WORDS.
+// Uses a Fisher-Yates partial shuffle so each swap is O(1) rather than
+// the O(remaining) element-shift caused by splice().
+function pickRandomWords(n) {
+  const pool = [...WORDS];
+  const limit = Math.min(n, pool.length);
+  for (let i = 0; i < limit; i++) {
+    const j = i + Math.floor(Math.random() * (pool.length - i));
+    [pool[i], pool[j]] = [pool[j], pool[i]];
+  }
+  return pool.slice(0, limit);
+}
+
+function isValidWordLocal(word) {
+  if (!word) return false;
+  const w = word.toUpperCase();
+  return /^[A-Z]{5}$/.test(w) && GUESSSET.has(w);
+}
+
+// ---------- Express app ----------
+const app = express();
+export { app };
+
+// ---------- CORS ----------
+// Build a set of allowed origins from config + dev defaults.
+const allowedOrigins = new Set(
+  [
+    ...(config.isProduction
+      ? []
+      : [
+          "http://localhost:5000",
+          "http://127.0.0.1:5000",
+          "http://localhost:5173",
+          "http://127.0.0.1:5173",
+        ]),
+    config.baseUrl,
+    ...config.corsAllowedOrigins,
+  ]
+    .map((v) => {
+      try {
+        return v ? new URL(v).origin : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean),
+);
+
+const allowedSuffixes = config.corsAllowedOriginSuffixes.map((s) =>
+  s.toLowerCase().replace(/^\*\./, "").replace(/^\./, ""),
+);
+
+function evaluateCorsOrigin(origin, cb) {
+  if (!origin) return cb(null, true);
+
+  if (allowedOrigins.has(origin)) return cb(null, true);
+
+  try {
+    const hostname = new URL(origin).hostname.toLowerCase();
+    if (
+      allowedSuffixes.some(
+        (sfx) => hostname === sfx || hostname.endsWith(`.${sfx}`),
+      )
+    ) {
+      return cb(null, true);
+    }
+  } catch {
+    /* malformed origin — fall through to reject */
+  }
+
+  cb(new Error(`CORS: Origin ${origin} not allowed`));
+}
+
+const corsOptions = {
+  origin: evaluateCorsOrigin,
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: true,
+};
+app.use(cors(corsOptions));
+app.options("*", cors(corsOptions));
+
+// ---------- Security headers ----------
+app.use(
+  helmet({
+    contentSecurityPolicy: config.isProduction
+      ? {
+          directives: {
+            defaultSrc: ["'self'"],
+            connectSrc: [
+              "'self'",
+              ...allowedOrigins,
+              "https://pagead2.googlesyndication.com",
+              "https://*.google.com",
+              "https://*.googlesyndication.com",
+              "https://*.doubleclick.net",
+            ],
+            scriptSrc: [
+              "'self'",
+              "https://pagead2.googlesyndication.com",
+              "https://www.googletagmanager.com",
+            ],
+            frameSrc: [
+              "'self'",
+              "https://googleads.g.doubleclick.net",
+              "https://tpc.googlesyndication.com",
+            ],
+            imgSrc: ["'self'", "data:", "https:", "blob:"],
+          },
+        }
+      : false,
+    crossOriginEmbedderPolicy: false,
+  }),
+);
+
+app.use(express.json());
+app.use(cookieParser());
+
+// ---------- Rate limiting ----------
+app.use("/api/", apiLimiter);
+app.use("/api/login", authLimiter);
+app.use("/api/callback", authLimiter);
+
+const shouldSetupAuth = !config.isTest && !config.skipAuthSetup;
+
+if (shouldSetupAuth) {
+  await setupAuth(app);
+}
+
+// Serve static files from client build in production
+if (config.isProduction) {
+  const clientDistPath = path.join(__dirname, "..", "client", "dist");
+  app.use(express.static(clientDistPath));
+} else {
+  // In development, show helpful page with link to frontend
+  app.get("/", (_req, res) => {
+    const frontendUrl = config.replitDevDomain
+      ? `https://5000--${config.replitDevDomain}`
+      : config.baseUrl;
+
+    res.send(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>EvoWordo Backend</title>
+        <style>
+          body { font-family: Arial, sans-serif; text-align: center; padding: 50px; background: #f5f5f5; }
+          .container { background: white; padding: 40px; border-radius: 10px; max-width: 600px; margin: 0 auto; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+          h1 { color: #5b21b6; }
+          .button { display: inline-block; margin-top: 20px; padding: 15px 30px; background: #5b21b6; color: white; text-decoration: none; border-radius: 5px; font-weight: bold; }
+          .button:hover { background: #7c3aed; }
+          p { color: #666; line-height: 1.6; }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <h1>🎮 EvoWordo Backend API</h1>
+          <p>You've reached the backend API server. The EvoWordo game frontend is running on a different port.</p>
+          <p><strong>Click the button below to access the game:</strong></p>
+          <a href="${frontendUrl}" class="button">Open EvoWordo →</a>
+          <p style="margin-top: 30px; font-size: 14px; color: #999;">Backend API running on port 8080 | Frontend on port 5000</p>
+        </div>
+      </body>
+      </html>
+    `);
+  });
+}
+
+// ---------- Health / readiness / liveness ----------
+app.get("/health", async (_req, res) => {
+  const health = {
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    environment: config.nodeEnv,
+  };
+
+  const DB_PING_MS = 2000;
+  try {
+    await Promise.race([
+      prisma.$queryRaw`SELECT 1`,
+      new Promise((_, reject) =>
+        setTimeout(
+          () => reject(new Error("database ping timeout")),
+          DB_PING_MS,
+        ),
+      ),
+    ]);
+    health.database = "connected";
+  } catch {
+    health.database = "disconnected";
+    health.status = "degraded";
+  }
+
+  health.wordLists = {
+    words: WORDSET.size,
+    guesses: GUESSSET.size,
+  };
+
+  health.activeRooms = await getActiveRoomCount();
+  health.resume = getResumeMetricsSnapshot();
+  const now = Date.now();
+  health.heartbeat = {
+    trackedSockets: socketHeartbeat.size,
+    staleSockets: [...socketHeartbeat.values()].filter(
+      (entry) => now - entry.lastHeartbeatAt > HEARTBEAT_STALE_MS,
+    ).length,
+  };
+
+  const statusCode = health.status === "ok" ? 200 : 503;
+  res.status(statusCode).json(health);
+});
+
+app.get("/ready", (_req, res) => {
+  const isReady = WORDSET.size > 0 && GUESSSET.size > 0;
+  if (isReady) {
+    res.status(200).json({ ready: true });
+  } else {
+    res.status(503).json({ ready: false, reason: "Word lists not loaded" });
+  }
+});
+
+app.get("/alive", (_req, res) => {
+  res.status(200).json({ alive: true });
+});
+app.get("/api/validate", (req, res) => {
+  const word = (req.query.word || "").toString();
+  res.json({ valid: isValidWordLocal(word) });
+});
+
+// ---------- Auth API endpoints ----------
+
+// Get current user (works for both anonymous and authenticated)
+app.get("/api/auth/user", pollingLimiter, async (req, res) => {
+  try {
+    let userId = getUserIdFromRequest(req);
+
+    // If no user session exists, create an anonymous one
+    if (!userId) {
+      const user = await getOrCreateAnonymousUser(null);
+      userId = user.id;
+      // Store in session for future requests
+      req.session.anonymousUserId = userId;
+      await req.session.save();
+    }
+
+    // Get full user profile
+    const profile = await getFullUserProfile(userId);
+
+    if (!profile) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json(profile);
+  } catch (error) {
+    console.error("Error fetching user:", error);
+    res.status(500).json({ message: "Failed to fetch user" });
+  }
+});
+
+// Sync lobby name from home screen / multiplayer (creates anonymous user if needed)
+app.post("/api/player/sync-display-name", async (req, res) => {
+  try {
+    const playerName = readPlayerNameFromRequest(req);
+    if (!playerName) {
+      return res.status(400).json({ error: "Invalid or missing playerName" });
+    }
+
+    let userId = getUserIdFromRequest(req);
+    if (!userId) {
+      const user = await getOrCreateAnonymousUser(null);
+      userId = user.id;
+    }
+    await ensureAnonymousSession(req, userId);
+
+    const displayName = await persistPlayerDisplayName(prisma, userId, playerName);
+    res.json({ ok: true, userId, displayName });
+  } catch (error) {
+    console.error("Error syncing display name:", error);
+    res.status(500).json({ error: "Failed to sync display name" });
+  }
+});
+
+app.post("/api/feedback", feedbackLimiter, async (req, res) => {
+  try {
+    const result = await submitFeedback(req, prisma, () => getUserIdFromRequest(req));
+    return res.status(result.status).json(result.body);
+  } catch (error) {
+    console.error("Error submitting feedback:", error);
+    res.status(500).json({ error: "Failed to submit feedback" });
+  }
+});
+
+// Update profile (works for anonymous and authenticated)
+const ALLOWED_AVATAR_KEYS = new Set([
+  "cat","dog","fox","panda","robot","alien","ghost","skull",
+  "flame","bolt","star","gem","rocket","crown","heart","moon",
+]);
+const HEX_COLOUR_RE = /^#[0-9a-fA-F]{6}$/;
+
+app.patch("/api/auth/profile", async (req, res) => {
+  try {
+    const userId = getUserIdFromRequest(req);
+    if (!userId) {
+      return res.status(401).json({ message: "No user session" });
+    }
+
+    const { displayName, profileAvatar, profileColour, equippedCosmetics } =
+      req.body || {};
+    const data = {};
+
+    if (displayName !== undefined) {
+      const trimmed = String(displayName).trim().slice(0, 20);
+      if (!isSafeInput(trimmed)) {
+        return res.status(400).json({ message: "Invalid display name" });
+      }
+      data.displayName = trimmed || null;
+    }
+
+    if (profileAvatar !== undefined) {
+      if (profileAvatar !== null && !ALLOWED_AVATAR_KEYS.has(profileAvatar)) {
+        return res.status(400).json({ message: "Invalid avatar" });
+      }
+      data.profileAvatar = profileAvatar;
+    }
+
+    if (profileColour !== undefined) {
+      if (profileColour !== null && !HEX_COLOUR_RE.test(profileColour)) {
+        return res.status(400).json({ message: "Invalid colour" });
+      }
+      data.profileColour = profileColour;
+    }
+
+    let equipResult = null;
+    if (equippedCosmetics !== undefined) {
+      equipResult = await updateEquippedCosmetics(userId, equippedCosmetics);
+      if (equipResult?.error) {
+        return res.status(400).json({ message: equipResult.error });
+      }
+    }
+
+    if (Object.keys(data).length === 0 && !equipResult) {
+      return res.status(400).json({ message: "No fields to update" });
+    }
+
+    if (Object.keys(data).length > 0) {
+      await prisma.user.update({ where: { id: userId }, data });
+    }
+    const profile = await getFullUserProfile(userId);
+
+    if (equipResult && !equipResult.error) {
+      void pushCosmeticUpdateToLiveRooms(userId, equipResult.equippedCosmetics);
+    }
+
+    res.json(profile);
+  } catch (error) {
+    console.error("Error updating profile:", error);
+    res.status(500).json({ message: "Failed to update profile" });
+  }
+});
+
+// Get user stats
+app.get("/api/auth/stats", async (req, res) => {
+  try {
+    const userId = getUserIdFromRequest(req);
+
+    if (!userId) {
+      return res.status(401).json({ message: "No user session" });
+    }
+
+    const profile = await getFullUserProfile(userId);
+
+    if (!profile) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    res.json(profile.stats);
+  } catch (error) {
+    console.error("Error fetching stats:", error);
+    res.status(500).json({ message: "Failed to fetch stats" });
+  }
+});
+
+app.get("/api/progression/catalog", (_req, res) => {
+  res.json(getPublicCatalog());
+});
+
+if (config.enableDevTools) {
+  app.post("/api/dev/grant-superuser", async (req, res) => {
+    try {
+      let userId = getUserIdFromRequest(req);
+      if (!userId) {
+        const user = await getOrCreateAnonymousUser(null);
+        userId = user.id;
+        req.session.anonymousUserId = userId;
+        await req.session.save();
+      }
+      const progression = await grantSuperUserProgression(userId);
+      if (!progression) {
+        return res.status(404).json({ error: "User not found" });
+      }
+      res.json({ ok: true, progression });
+    } catch (error) {
+      console.error("[dev] grant-superuser failed:", error);
+      res.status(500).json({ error: "Failed to grant super user progression" });
+    }
+  });
+}
+
+// GET /api/random?letters=5 -> { word: "FLARE" }
+app.get("/api/random", (_req, res) => {
+  // we only have 5-letter words in WORDS, but keep the param for future use
+  const pool = WORDS; // or filter by length if you add other lists later
+  const word = pool[Math.floor(Math.random() * pool.length)] || null;
+  res.json({ word });
+});
+
+// GET /api/random-word -> { word: "FLARE" }
+app.get("/api/random-word", (_req, res) => {
+  const w = WORDS[Math.floor(Math.random() * WORDS.length)];
+  res.json({ word: w });
+});
+
+// Optional: hot-reload words (disable/protect in prod)
+app.post("/api/reload-words", async (_req, res) => {
+  try {
+    await loadWords();
+    res.json({ ok: true, count: WORDS.length, guesses: GUESSSET.size });
+  } catch (e) {
+    console.error("reload-words failed:", e);
+    res.status(500).json({ ok: false });
+  }
+});
+
+// ---------- Daily Challenge ----------
+const MAX_DAILY_GUESSES = 6;
+const DAILY_WORD_LENGTH = 5;
+
+// GET /api/daily - Load daily challenge
+app.get("/api/daily", async (req, res) => {
+  try {
+    let userId = getUserIdFromRequest(req);
+
+    // If no userId from client, create one
+    if (!userId) {
+      const user = await getOrCreateAnonymousUser(null);
+      userId = user.id;
+    }
+    await ensureAnonymousSession(req, userId);
+    await syncDisplayNameForUser(userId, readPlayerNameFromRequest(req));
+
+    const puzzle = await getTodaysPuzzle();
+    const existingResult = await getUserDailyResult(userId, puzzle.id);
+
+    const guesses = existingResult?.guesses || [];
+    const patterns = existingResult?.patterns || [];
+    const gameOver = existingResult?.completed || false;
+    const won = existingResult?.won || false;
+
+    const responseData = {
+      title: "Daily Challenge",
+      subtitle: `Challenge for ${puzzle.date}`,
+      date: puzzle.date,
+      wordLength: DAILY_WORD_LENGTH,
+      maxGuesses: MAX_DAILY_GUESSES,
+      guesses,
+      patterns,
+      gameOver,
+      won,
+      word: gameOver ? puzzle.word : undefined,
+      userId, // Send back the userId for client to store
+    };
+    console.log("[GET /api/daily] Response:", {
+      userId,
+      gameOver,
+      won,
+      word: responseData.word,
+      guessCount: guesses.length,
+    });
+    res.json(responseData);
+  } catch (error) {
+    console.error("Error in GET /api/daily:", error);
+    res.status(500).json({ error: "Failed to load daily challenge" });
+  }
+});
+
+// POST /api/daily/guess - Submit a guess
+app.post("/api/daily/guess", async (req, res) => {
+  try {
+    const existingUserId = getUserIdFromRequest(req);
+    const { guess } = req.body;
+
+    if (!guess || typeof guess !== "string") {
+      return res.status(400).json({ error: "Invalid guess" });
+    }
+
+    const guessUpper = guess.toUpperCase();
+
+    if (!isValidWordLocal(guessUpper)) {
+      return res.status(400).json({ error: "Not a valid word" });
+    }
+
+    // Fetch user and today's puzzle in parallel — they are independent
+    const [user, puzzle] = await Promise.all([
+      getOrCreateAnonymousUser(existingUserId),
+      getTodaysPuzzle(),
+    ]);
+    const userId = user.id;
+    await syncDisplayNameForUser(userId, readPlayerNameFromRequest(req));
+
+    const existingResult = await getUserDailyResult(userId, puzzle.id);
+
+    const guesses = existingResult?.guesses || [];
+    const patterns = existingResult?.patterns || [];
+    const gameOver = existingResult?.completed || false;
+
+    if (gameOver) {
+      return res.json({
+        error: "Challenge already completed",
+        gameOver: true,
+        won: existingResult.won,
+      });
+    }
+
+    if (guesses.includes(guessUpper)) {
+      return res.status(400).json({ error: "Already guessed that word" });
+    }
+
+    if (guesses.length >= MAX_DAILY_GUESSES) {
+      return res.status(400).json({ error: "No more guesses left" });
+    }
+
+    const pattern = scoreGuess(puzzle.word, guessUpper);
+
+    const newGuesses = [...guesses, guessUpper];
+    const newPatterns = [...patterns, pattern];
+
+    const won = pattern.every(
+      (state) => state === "green" || state === "correct"
+    );
+    const outOfGuesses = newGuesses.length >= MAX_DAILY_GUESSES;
+    const completed = won || outOfGuesses;
+
+    await createOrUpdateDailyResult(userId, puzzle.id, {
+      guesses: newGuesses,
+      patterns: newPatterns,
+      won,
+      completed,
+    });
+
+    let progressionPayload = null;
+    if (completed) {
+      const firstToday = await isFirstDailyToday(userId);
+      progressionPayload = await processDailyComplete(userId, {
+        won,
+        attempts: newGuesses.length,
+        isFirstDailyToday: firstToday,
+      });
+    }
+
+    const guessResponse = {
+      pattern,
+      correct: won,
+      gameOver: completed,
+      won,
+      word: completed ? puzzle.word : undefined,
+      message: won
+        ? "🎉 Congratulations! You solved today's puzzle!"
+        : outOfGuesses
+        ? `Game over! The word was ${puzzle.word}`
+        : "",
+      progression: progressionPayload,
+    };
+    res.json(guessResponse);
+  } catch (error) {
+    console.error("Error in POST /api/daily/guess:", error);
+    res.status(500).json({ error: "Failed to process guess" });
+  }
+});
+
+// GET /api/daily/stats - Get user's daily challenge statistics
+app.get("/api/daily/stats", pollingLimiter, async (req, res) => {
+  try {
+    const cookieUserId = getUserIdFromRequest(req);
+
+    if (!cookieUserId) {
+      return res.json({
+        totalPlayed: 0,
+        totalWins: 0,
+        winRate: 0,
+        currentStreak: 0,
+        maxStreak: 0,
+        recentResults: [],
+      });
+    }
+    await ensureAnonymousSession(req, cookieUserId);
+
+    const stats = await getUserDailyStats(cookieUserId);
+    res.json(stats);
+  } catch (error) {
+    console.error("Error in GET /api/daily/stats:", error);
+    res.status(500).json({ error: "Failed to load stats" });
+  }
+});
+
+// ---------- Rooms ----------
+/**
+ * Room schema:
+ * {
+ *   id, mode: 'duel' | 'battle' | 'battle_ai', hostId,
+ *   players: { [socketId]: { name, guesses: [], done: false, ready: false, secret: string|null } },
+ *   started, winner,
+ *   duelReveal?: { [socketId]: secret }, // populated at end of duel
+ *   battle: {
+ *     secret,
+ *     started,
+ *     winner,
+ *     lastRevealedWord,
+ *     deadline,
+ *     countdownEndsAt,
+ *     aiHost?: { mode: 'auto' | 'player', claimedBy: string|null }
+ *   }
+ * }
+ */
+const VALID_MODES = new Set(["duel", "shared", "battle", "battle_ai"]);
+
+const SOCKET_DISCONNECT_GRACE_MS = 5 * 1000; // 5 seconds
+const HEARTBEAT_STALE_MS = 45 * 1000;
+const HEARTBEAT_CHECK_INTERVAL_MS = 15 * 1000;
+const pendingDisconnectTimers = new Map();
+const pendingSharedCloseTimers = new Map();
+const pendingDuelCloseTimers = new Map();
+const pendingBattleHostLeaveTimers = new Map();
+const pendingAbandonedCloseTimers = new Map();
+const socketHeartbeat = new Map();
+const resumeMetrics = {
+  attempts: 0,
+  success: 0,
+  failure: 0,
+  timeoutExpired: 0,
+  totalLatencyMs: 0,
+  byCode: new Map(),
+};
+
+const AI_BATTLE_EVENT_BASE_KEY = "ai_battle_hour";
+let aiBattleEventActive = config.aiBattleEventActive;
+let currentEventSlot = config.aiBattleEventSlot;
+let currentAiBattleEventKey = AI_BATTLE_EVENT_BASE_KEY;
+let currentAiBattleEventRunId = null;
+const activeLiveOpsEvents = new Map();
+
+function setCurrentEventSlot(slot) {
+  if (typeof slot === "string" && slot.trim()) {
+    currentEventSlot = slot.trim();
+  }
+}
+const AI_BATTLE_EVENT_INTERVAL_MS = 30 * 1000;
+let ioRef = null;
+
+const isTruthy = (value) =>
+  typeof value === "string"
+    ? ["true", "1", "yes", "on"].includes(value.toLowerCase())
+    : Boolean(value);
+
+function computeAiBattleEventId(date = new Date()) {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(date.getUTCDate()).padStart(2, "0");
+  return `${AI_BATTLE_EVENT_BASE_KEY}_${year}${month}${day}`;
+}
+
+function isAiBattleEventActive() {
+  return aiBattleEventActive;
+}
+
+async function setAiBattleEventActive(nextActive) {
+  const normalized = isTruthy(nextActive);
+  const previous = aiBattleEventActive;
+  if (previous === normalized) {
+    if (normalized) {
+      await ensureAiBattleEventRoom();
+    } else {
+      await retireAiBattleEventRooms();
+    }
+    return await getAiBattleEventStatus();
+  }
+  aiBattleEventActive = normalized;
+  if (normalized) {
+    await ensureAiBattleEventRoom();
+  } else {
+    await retireAiBattleEventRooms();
+  }
+  return await getAiBattleEventStatus();
+}
+
+function getAiBattleEventContext() {
+  if (!isAiBattleEventActive()) return null;
+  return {
+    key: currentAiBattleEventKey || AI_BATTLE_EVENT_BASE_KEY,
+    eventId: currentAiBattleEventRunId || computeAiBattleEventId(),
+    runId: currentAiBattleEventRunId || null,
+    slot: currentEventSlot,
+  };
+}
+
+function tagRoomAsEvent(room, ctx) {
+  room.meta = {
+    ...(room.meta || {}),
+    isEvent: true,
+    eventKey: ctx.key,
+    eventId: ctx.eventId,
+    eventRunId: ctx.runId || ctx.eventId,
+    slot: ctx.slot,
+    featured: true,
+  };
+  room.hostId = "server";
+  room.hostConnected = true;
+}
+
+function ensureEventRoomDefaults(room, ctx) {
+  tagRoomAsEvent(room, ctx);
+  if (!room.battle) {
+    battleMode.initBattleRoom(room);
+  }
+  room.mode = "battle_ai";
+  room.battle.aiHost = {
+    mode: "auto",
+    claimedBy: null,
+    pendingStart: false,
+  };
+  room.battle.pendingStart = false;
+  room.battle.countdownEndsAt = room.battle.countdownEndsAt ?? null;
+  room.battle.deadline = room.battle.deadline ?? null;
+  room.updatedAt = Date.now();
+}
+
+async function createAiBattleEventRoom(ctx) {
+  const id = Math.random().toString(36).slice(2, 8).toUpperCase();
+  const now = Date.now();
+  const room = {
+    id,
+    mode: "battle_ai",
+    hostId: "server",
+    hostConnected: true,
+    players: {},
+    started: false,
+    winner: null,
+    duelReveal: undefined,
+    duelDeadline: null,
+    roundClosed: false,
+    createdAt: now,
+    updatedAt: now,
+    meta: {
+      isEvent: true,
+      eventKey: ctx.key,
+      eventId: ctx.eventId,
+      eventRunId: ctx.runId || ctx.eventId,
+      slot: ctx.slot,
+      featured: true,
+    },
+  };
+
+  duelMode.initDuelRoom(room);
+  sharedMode.initSharedRoom(room, { pickRandomWords });
+  battleMode.initBattleRoom(room);
+  room.battle.aiHost = {
+    mode: "auto",
+    claimedBy: null,
+    pendingStart: false,
+  };
+  await saveRoom(room);
+  await scheduleAiBattleCountdown(id);
+  return room;
+}
+
+async function ensureAiBattleEventRoom() {
+  const ctx = getAiBattleEventContext();
+  if (!ctx) return null;
+  let activeRoom = null;
+  const staleRooms = [];
+  const ids = await listRoomIds();
+  for (const roomId of ids) {
+    const room = await getRoom(roomId);
+    if (!room) continue;
+    if (room.meta?.isEvent && room.meta.eventKey === ctx.key) {
+      if (room.meta.eventId === ctx.eventId) {
+        activeRoom = room;
+      } else {
+        staleRooms.push({ roomId, room });
+      }
+    }
+  }
+
+  for (const { roomId, room } of staleRooms) {
+    room.meta.isEvent = false;
+    room.meta.featured = false;
+    room.meta.eventEndedAt = Date.now();
+    if (room.hostId === "server") {
+      room.hostId = null;
+      room.hostConnected = false;
+    }
+    await saveRoom(room);
+    if (ioRef) {
+      ioRef.to(roomId).emit("roomState", sanitizeRoom(room));
+    }
+  }
+
+  if (!activeRoom) {
+    activeRoom = await createAiBattleEventRoom(ctx);
+  } else {
+    ensureEventRoomDefaults(activeRoom, ctx);
+    if (getActivePlayerIds(activeRoom).length === 0) {
+      await scheduleAiBattleCountdown(activeRoom.id);
+    }
+    await saveRoom(activeRoom);
+  }
+
+  if (ioRef) {
+    ioRef.to(activeRoom.id).emit("roomState", sanitizeRoom(activeRoom));
+  }
+  return activeRoom;
+}
+
+async function findActiveAiBattleEventRoom(ctx = getAiBattleEventContext()) {
+  if (!ctx) return null;
+  const ids = await listRoomIds();
+  for (const roomId of ids) {
+    const room = await getRoom(roomId);
+    if (
+      room &&
+      room.meta?.isEvent &&
+      room.meta.eventKey === ctx.key &&
+      room.meta.eventId === ctx.eventId
+    ) {
+      return room;
+    }
+  }
+  return null;
+}
+
+async function completeEventRetirementIfPending(room) {
+  if (!room?.meta?.eventRetiring) return false;
+  room.meta.isEvent = false;
+  room.meta.eventRetiring = false;
+  room.meta.eventEndedAt = Date.now();
+  room.meta.featured = false;
+  if (room.hostId === "server") {
+    room.hostId = null;
+    room.hostConnected = false;
+  }
+  clearAiBattleTimers(room);
+  await saveRoom(room);
+  if (ioRef) {
+    ioRef.to(room.id).emit("roomState", sanitizeRoom(room));
+  }
+  return true;
+}
+
+async function retireAiBattleEventRooms(eventKey = currentAiBattleEventKey || AI_BATTLE_EVENT_BASE_KEY) {
+  const ids = await listRoomIds();
+  for (const roomId of ids) {
+    const room = await getRoom(roomId);
+    if (!room) continue;
+    if (room.meta?.isEvent && room.meta.eventKey === eventKey) {
+      if (room.battle?.started) {
+        room.meta.eventRetiring = true;
+        await saveRoom(room);
+        if (ioRef) {
+          ioRef.to(roomId).emit("roomState", sanitizeRoom(room));
+        }
+        continue;
+      }
+      room.meta.eventRetiring = true;
+      await completeEventRetirementIfPending(room);
+    }
+  }
+}
+
+async function getAiBattleEventStatus() {
+  const ctx = getAiBattleEventContext();
+  const room = ctx ? await findActiveAiBattleEventRoom(ctx) : null;
+  return {
+    active: Boolean(ctx && room),
+    eventKey: ctx?.key ?? currentAiBattleEventKey ?? AI_BATTLE_EVENT_BASE_KEY,
+    eventId: ctx?.eventId ?? null,
+    eventRunId: ctx?.runId ?? null,
+    slot: ctx?.slot ?? currentEventSlot,
+    roomId: room?.id ?? null,
+    featured: Boolean(room?.meta?.featured),
+    hostId: room?.hostId ?? null,
+  };
+}
+
+function publicEventContext(event, run) {
+  return {
+    eventId: event.id,
+    eventRunId: run.id,
+    eventKey: event.eventKey,
+    mode: event.mode,
+    name: event.name,
+    slot: event.scheduleSlot,
+    featured: Boolean(event.featured),
+    rules: event.rules || null,
+    theme: event.theme || null,
+    rewards: event.rewards || null,
+    plannedEndAt: run.plannedEndAt,
+  };
+}
+
+function getActiveEventForMode(mode) {
+  for (const ctx of activeLiveOpsEvents.values()) {
+    if (ctx.mode === mode) return ctx;
+  }
+  return null;
+}
+
+function tagRoomWithLiveOpsEvent(room, ctx) {
+  if (!room || !ctx) return false;
+  if (room.meta?.eventRunId === ctx.eventRunId) return false;
+  room.meta = {
+    ...(room.meta || {}),
+    isEvent: true,
+    eventKey: ctx.eventKey,
+    eventId: ctx.eventRunId,
+    eventRunId: ctx.eventRunId,
+    slot: ctx.slot,
+    featured: ctx.featured,
+    eventName: ctx.name,
+    eventMode: ctx.mode,
+    eventRules: ctx.rules,
+    eventTheme: ctx.theme,
+    eventRewards: ctx.rewards,
+    plannedEndAt: ctx.plannedEndAt,
+  };
+  if (room.mode === "battle" || room.mode === "battle_ai") {
+    const roundMs = Number(ctx.rules?.roundMs);
+    if (Number.isFinite(roundMs) && roundMs > 0) {
+      room.battle.roundMs = roundMs;
+    }
+    const maxGuesses = Number(ctx.rules?.maxGuesses);
+    if (Number.isFinite(maxGuesses) && maxGuesses > 0) {
+      room.battle.maxGuesses = maxGuesses;
+    }
+  }
+  return true;
+}
+
+async function activateEventRun({ event, run }) {
+  const ctx = publicEventContext(event, run);
+  activeLiveOpsEvents.set(run.id, ctx);
+  if (event.mode === "battle_ai") {
+    currentAiBattleEventKey = event.eventKey;
+    currentAiBattleEventRunId = run.id;
+    setCurrentEventSlot(event.scheduleSlot);
+    await setAiBattleEventActive(true);
+  }
+  return { ok: true };
+}
+
+async function deactivateEventRun({ event, run }) {
+  if (run?.id) activeLiveOpsEvents.delete(run.id);
+  if (event.mode === "battle_ai" && currentAiBattleEventRunId === run?.id) {
+    await setAiBattleEventActive(false);
+    currentAiBattleEventKey = AI_BATTLE_EVENT_BASE_KEY;
+    currentAiBattleEventRunId = null;
+  }
+  return { ok: true };
+}
+
+async function getRuntimeSnapshot() {
+  const rooms = [];
+  for (const roomId of await listRoomIds()) {
+    const room = await getRoom(roomId);
+    if (!room?.meta?.isEvent) continue;
+    rooms.push({
+      roomId,
+      mode: room.mode,
+      eventKey: room.meta.eventKey,
+      eventRunId: room.meta.eventRunId || null,
+      activePlayers: getActivePlayerIds(room).length,
+      inProgress: isRoomInProgress(room),
+    });
+  }
+  return { activeEvents: [...activeLiveOpsEvents.values()], rooms };
+}
+
+const adminEventsRouter = createAdminEventsRouter({
+  setAiBattleEventActive,
+  getAiBattleEventStatus,
+});
+app.use("/admin/events", adminEventsRouter);
+
+registerEventRuntime({
+  setAiBattleEventActive,
+  setCurrentEventSlot,
+  activateEventRun,
+  deactivateEventRun,
+  getRuntimeSnapshot,
+});
+
+app.use(
+  "/api/admin",
+  createAdminRouter({
+    prisma,
+    getActiveRoomCount,
+    getRuntimeSnapshot,
+  }),
+);
+
+try {
+  await syncActiveEventsOnStartup(prisma);
+} catch (error) {
+  console.error("Failed to sync scheduled events on startup:", error.message);
+  if (!config.isTest) {
+    console.warn("Continuing without scheduled event sync");
+  }
+}
+
+if (!config.isTest) {
+  setInterval(() => {
+    tickScheduledEvents(prisma).catch((error) => {
+      console.warn("[live-ops] scheduled event tick failed", error.message);
+    });
+  }, 30 * 1000);
+}
+
+function summarizeJoinableRoom(room) {
+  if (!room) return null;
+
+  const players = Object.values(room.players || {});
+  const activePlayers = players.filter((player) => !player?.disconnected);
+  const isEventRoom = Boolean(room.meta?.isEvent);
+  if (activePlayers.length === 0 && !isEventRoom) return null;
+
+  let joinable = true;
+  let capacity = null;
+
+  if (room.mode === "duel") {
+    joinable = !duelMode.canJoinDuel(room)?.error;
+    capacity = 2;
+  } else if (room.mode === "shared") {
+    joinable = !sharedMode.canJoinShared(room)?.error;
+    capacity = 2;
+  } else if (room.mode === "battle") {
+    joinable = !battleMode.canJoinBattle(room)?.error;
+  } else if (room.mode === "battle_ai") {
+    joinable = true;
+  } else {
+    joinable = false;
+  }
+
+  if (!joinable) return null;
+
+  const host = room.players ? room.players[room.hostId] : null;
+  if (room.mode !== "battle_ai") {
+    if (!host || host.disconnected) return null;
+  }
+
+  const updatedAt = Number(room.updatedAt || room.createdAt || Date.now());
+  const createdAt = Number(room.createdAt || updatedAt);
+
+  const isInProgress =
+    room.mode === "battle" || room.mode === "battle_ai"
+      ? Boolean(room.battle?.started)
+      : room.mode === "shared"
+      ? Boolean(room.shared?.started)
+      : Boolean(room.started);
+
+  const displayHostName =
+    room.mode === "battle_ai"
+      ? room.battle?.aiHost?.mode === "player"
+        ? host?.name || "Player Host"
+        : room.meta?.isEvent
+        ? "AI Battle Hour"
+        : "AI Host"
+      : host?.name || "Host";
+
+  return {
+    id: room.id,
+    mode: room.mode,
+    hostName: displayHostName,
+    playerCount: activePlayers.length,
+    totalPlayers: players.length,
+    capacity,
+    isInProgress,
+    createdAt,
+    updatedAt,
+  };
+}
+
+app.get("/api/rooms/open", pollingLimiter, async (_req, res) => {
+  const summaries = [];
+
+  const ids = await listRoomIds();
+  for (const id of ids) {
+    const room = await getRoom(id);
+    if (!room) continue;
+    const summary = summarizeJoinableRoom(room);
+    if (summary) summaries.push(summary);
+  }
+
+  summaries.sort((a, b) => {
+    if (b.updatedAt !== a.updatedAt) return b.updatedAt - a.updatedAt;
+    return b.createdAt - a.createdAt;
+  });
+
+  res.json({ rooms: summaries.slice(0, 20) });
+});
+
+app.get("/api/events/status", pollingLimiter, async (_req, res) => {
+  res.json(await getAiBattleEventStatus());
+});
+
+// ---------- Leaderboard API ----------
+app.get("/api/leaderboard/top-players", pollingLimiter, async (_req, res) => {
+  try {
+    const topPlayers = await prisma.user.findMany({
+      where: { ...LEADERBOARD_USER_FILTER, totalWins: { gt: 0 } },
+      orderBy: { totalWins: "desc" },
+      take: 10,
+      select: {
+        id: true,
+        displayName: true,
+        username: true,
+        email: true,
+        totalWins: true,
+        totalGames: true,
+      },
+    });
+    res.json(decorateLeaderboardRows(topPlayers));
+  } catch (error) {
+    console.error("Leaderboard error:", error);
+    res.status(500).json({ error: "Failed to fetch leaderboard" });
+  }
+});
+
+app.get("/api/leaderboard/streaks", pollingLimiter, async (_req, res) => {
+  try {
+    const topStreaks = await prisma.user.findMany({
+      where: { ...LEADERBOARD_USER_FILTER, longestStreak: { gt: 0 } },
+      orderBy: { longestStreak: "desc" },
+      take: 10,
+      select: {
+        id: true,
+        displayName: true,
+        username: true,
+        email: true,
+        streak: true,
+        longestStreak: true,
+      },
+    });
+    res.json(decorateLeaderboardRows(topStreaks));
+  } catch (error) {
+    console.error("Streaks error:", error);
+    res.status(500).json({ error: "Failed to fetch streaks" });
+  }
+});
+
+const skillLeaderboardSelect = {
+  id: true,
+  displayName: true,
+  username: true,
+  email: true,
+  profileAvatar: true,
+  totalWins: true,
+};
+
+const skillLeaderboardWhere = {
+  ...LEADERBOARD_USER_FILTER,
+  totalWins: { gte: MIN_SKILL_LEADERBOARD_WINS },
+};
+
+function mapSkillRow(user, extra = {}) {
+  return decorateLeaderboardRow({
+    ...user,
+    gamesWon: user.totalWins,
+    ...extra,
+  });
+}
+
+app.get("/api/leaderboard/categories", pollingLimiter, async (_req, res) => {
+  try {
+    const [wins, streaks, winRateRows, bestSolve, avgGuesses, efficiency] =
+      await Promise.all([
+      prisma.user.findMany({
+        where: { ...LEADERBOARD_USER_FILTER, totalWins: { gt: 0 } },
+        orderBy: { totalWins: "desc" },
+        take: 20,
+        select: {
+          id: true,
+          displayName: true,
+          username: true,
+          email: true,
+          profileAvatar: true,
+          totalWins: true,
+          totalGames: true,
+        },
+      }),
+      prisma.user.findMany({
+        where: { ...LEADERBOARD_USER_FILTER, longestStreak: { gt: 0 } },
+        orderBy: { longestStreak: "desc" },
+        take: 20,
+        select: {
+          id: true,
+          displayName: true,
+          username: true,
+          email: true,
+          profileAvatar: true,
+          streak: true,
+          longestStreak: true,
+        },
+      }),
+      prisma.$queryRaw`
+        SELECT id, "displayName", username, email, "profileAvatar", "totalWins", "totalGames",
+               ROUND("totalWins"::numeric / GREATEST("totalGames", 1) * 100, 1) as "winRate"
+        FROM "User"
+        WHERE "mergedIntoUserId" IS NULL AND "totalGames" >= 10
+        ORDER BY "totalWins"::numeric / GREATEST("totalGames", 1) DESC
+        LIMIT 20
+      `,
+      prisma.user.findMany({
+        where: { ...skillLeaderboardWhere, bestSolveAttempts: { not: null } },
+        orderBy: [
+          { bestSolveAttempts: "asc" },
+          { avgEfficiencyScore: "desc" },
+          { totalWins: "desc" },
+        ],
+        take: 20,
+        select: {
+          ...skillLeaderboardSelect,
+          bestSolveAttempts: true,
+          avgEfficiencyScore: true,
+        },
+      }),
+      prisma.user.findMany({
+        where: { ...skillLeaderboardWhere, avgSolveAttempts: { not: null } },
+        orderBy: [{ avgSolveAttempts: "asc" }, { totalWins: "desc" }],
+        take: 20,
+        select: {
+          ...skillLeaderboardSelect,
+          avgSolveAttempts: true,
+        },
+      }),
+      prisma.user.findMany({
+        where: { ...skillLeaderboardWhere, avgEfficiencyScore: { not: null } },
+        orderBy: [{ avgEfficiencyScore: "desc" }, { totalWins: "desc" }],
+        take: 20,
+        select: {
+          ...skillLeaderboardSelect,
+          avgEfficiencyScore: true,
+        },
+      }),
+    ]);
+
+    res.json({
+      wins: decorateLeaderboardRows(wins),
+      streaks: decorateLeaderboardRows(streaks),
+      winRate: decorateLeaderboardRows(
+        winRateRows.map((r) => ({ ...r, winRate: Number(r.winRate) }))
+      ),
+      bestSolve: bestSolve.map((u) => mapSkillRow(u)),
+      avgGuesses: avgGuesses.map((u) =>
+        mapSkillRow(u, { avgGuesses: u.avgSolveAttempts })
+      ),
+      efficiency: efficiency.map((u) => mapSkillRow(u)),
+    });
+  } catch (error) {
+    console.error("Leaderboard categories error:", error);
+    res.status(500).json({ error: "Failed to fetch leaderboard categories" });
+  }
+});
+
+function getWeekStartUTC() {
+  const now = new Date();
+  const day = now.getUTCDay();
+  const diff = day === 0 ? 6 : day - 1;
+  const monday = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - diff));
+  return monday;
+}
+
+app.get("/api/leaderboard/weekly", pollingLimiter, async (_req, res) => {
+  try {
+    const weekStart = getWeekStartUTC();
+    const rows = await prisma.$queryRaw`
+      SELECT u.id, u."displayName", u.username, u.email, u."profileAvatar",
+             COUNT(*)::int as "weeklyWins"
+      FROM "DailyResult" dr
+      JOIN "User" u ON u.id = dr."userId"
+      WHERE dr.won = true AND dr."createdAt" >= ${weekStart}
+        AND u."mergedIntoUserId" IS NULL
+      GROUP BY u.id, u."displayName", u.username, u.email, u."profileAvatar"
+      ORDER BY "weeklyWins" DESC
+      LIMIT 20
+    `;
+    res.json(decorateLeaderboardRows(rows));
+  } catch (error) {
+    console.error("Weekly leaderboard error:", error);
+    res.status(500).json({ error: "Failed to fetch weekly leaderboard" });
+  }
+});
+
+app.get("/api/leaderboard/near-me", pollingLimiter, async (req, res) => {
+  const userId = getUserIdFromRequest(req);
+  if (!userId) return res.status(401).json({ error: "Not authenticated" });
+
+  const category = (req.query.category || "wins").toString();
+  const NEIGHBORS = 3;
+
+  try {
+    let rankedQuery;
+    switch (category) {
+      case "winRate":
+        rankedQuery = `
+          SELECT id, "displayName", username, email, "profileAvatar", "totalWins", "totalGames",
+                 ROUND("totalWins"::numeric / GREATEST("totalGames", 1) * 100, 1) as "statValue",
+                 ROW_NUMBER() OVER (ORDER BY "totalWins"::numeric / GREATEST("totalGames", 1) DESC, "totalWins" DESC) as rank
+          FROM "User"
+          WHERE "mergedIntoUserId" IS NULL AND "totalGames" >= 10
+        `;
+        break;
+      case "streaks":
+        rankedQuery = `
+          SELECT id, "displayName", username, email, "profileAvatar", streak, "longestStreak",
+                 "longestStreak" as "statValue",
+                 ROW_NUMBER() OVER (ORDER BY "longestStreak" DESC, streak DESC) as rank
+          FROM "User"
+          WHERE "mergedIntoUserId" IS NULL AND "longestStreak" > 0
+        `;
+        break;
+      case "bestSolve":
+        rankedQuery = `
+          SELECT id, "displayName", username, email, "profileAvatar", "bestSolveAttempts",
+                 "totalWins" as "gamesWon",
+                 "bestSolveAttempts" as "statValue",
+                 ROW_NUMBER() OVER (
+                   ORDER BY "bestSolveAttempts" ASC,
+                            "avgEfficiencyScore" DESC NULLS LAST,
+                            "totalWins" DESC
+                 ) as rank
+          FROM "User"
+          WHERE "mergedIntoUserId" IS NULL
+            AND "totalWins" >= ${MIN_SKILL_LEADERBOARD_WINS}
+            AND "bestSolveAttempts" IS NOT NULL
+        `;
+        break;
+      case "avgGuesses":
+        rankedQuery = `
+          SELECT id, "displayName", username, email, "profileAvatar", "avgSolveAttempts",
+                 "totalWins" as "gamesWon",
+                 "avgSolveAttempts" as "statValue",
+                 ROW_NUMBER() OVER (
+                   ORDER BY "avgSolveAttempts" ASC, "totalWins" DESC
+                 ) as rank
+          FROM "User"
+          WHERE "mergedIntoUserId" IS NULL
+            AND "totalWins" >= ${MIN_SKILL_LEADERBOARD_WINS}
+            AND "avgSolveAttempts" IS NOT NULL
+        `;
+        break;
+      case "efficiency":
+        rankedQuery = `
+          SELECT id, "displayName", username, email, "profileAvatar", "avgEfficiencyScore",
+                 "totalWins" as "gamesWon",
+                 "avgEfficiencyScore" as "statValue",
+                 ROW_NUMBER() OVER (
+                   ORDER BY "avgEfficiencyScore" DESC, "totalWins" DESC
+                 ) as rank
+          FROM "User"
+          WHERE "mergedIntoUserId" IS NULL
+            AND "totalWins" >= ${MIN_SKILL_LEADERBOARD_WINS}
+            AND "avgEfficiencyScore" IS NOT NULL
+        `;
+        break;
+      case "weekly": {
+        const weekStart = getWeekStartUTC();
+        const rows = await prisma.$queryRaw`
+          WITH ranked AS (
+            SELECT u.id, u."displayName", u.username, u.email, u."profileAvatar",
+                   COUNT(*)::int as "weeklyWins",
+                   ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) as rank
+            FROM "DailyResult" dr
+            JOIN "User" u ON u.id = dr."userId"
+            WHERE dr.won = true AND dr."createdAt" >= ${weekStart}
+              AND u."mergedIntoUserId" IS NULL
+            GROUP BY u.id, u."displayName", u.username, u.email, u."profileAvatar"
+          )
+          SELECT * FROM ranked
+          WHERE rank BETWEEN
+            (SELECT GREATEST(rank - ${NEIGHBORS}, 1) FROM ranked WHERE id = ${userId})
+            AND
+            (SELECT rank + ${NEIGHBORS} FROM ranked WHERE id = ${userId})
+        `;
+        const myRow = rows.find((r) => r.id === userId);
+        return res.json({
+          myRank: myRow ? Number(myRow.rank) : null,
+          total: rows.length,
+          players: decorateLeaderboardRows(
+            rows.map((r) => ({
+              ...r,
+              rank: Number(r.rank),
+              weeklyWins: Number(r.weeklyWins),
+            }))
+          ),
+        });
+      }
+      default:
+        rankedQuery = `
+          SELECT id, "displayName", username, email, "profileAvatar", "totalWins", "totalGames",
+                 "totalWins" as "statValue",
+                 ROW_NUMBER() OVER (ORDER BY "totalWins" DESC, "totalGames" DESC) as rank
+          FROM "User"
+          WHERE "mergedIntoUserId" IS NULL AND "totalWins" > 0
+        `;
+        break;
+    }
+
+    const rows = await prisma.$queryRawUnsafe(`
+      WITH ranked AS (${rankedQuery})
+      SELECT * FROM ranked
+      WHERE rank BETWEEN
+        (SELECT GREATEST(rank - ${NEIGHBORS}, 1) FROM ranked WHERE id = '${userId}')
+        AND
+        (SELECT rank + ${NEIGHBORS} FROM ranked WHERE id = '${userId}')
+    `);
+
+    const myRow = rows.find((r) => r.id === userId);
+    res.json({
+      myRank: myRow ? Number(myRow.rank) : null,
+      total: rows.length,
+      players: decorateLeaderboardRows(
+        rows.map((r) => ({
+          ...r,
+          rank: Number(r.rank),
+          statValue: Number(r.statValue),
+        }))
+      ),
+    });
+  } catch (error) {
+    console.error("Near-me leaderboard error:", error);
+    res.status(500).json({ error: "Failed to fetch near-me leaderboard" });
+  }
+});
+
+function normalizeMode(mode) {
+  const candidate = (mode || "").toString().toLowerCase();
+  return VALID_MODES.has(candidate) ? candidate : "duel";
+}
+
+function normalizePlayerId(playerId) {
+  const value = (playerId || "").toString().trim();
+  return value || null;
+}
+
+/** Within 5–10 min policy window for resume after disconnect. */
+const RESUME_MAX_DISCONNECT_MS = 8 * 60 * 1000;
+
+function isValidUuidPlayerId(value) {
+  if (typeof value !== "string") return false;
+  const v = value.trim();
+  return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$/.test(
+    v,
+  );
+}
+
+function resumeError(cb, error, code) {
+  cb?.({ ok: false, error, code });
+}
+
+function logReconnect(event, socket, extra = {}) {
+  console.log(
+    `[reconnect] ${event} socket=${socket.id} transport=${socket.conn?.transport?.name || "unknown"} extra=${JSON.stringify(
+      extra,
+    )}`,
+  );
+}
+
+function trackResumeResult({ ok, code, latencyMs }) {
+  resumeMetrics.attempts += 1;
+  if (ok) {
+    resumeMetrics.success += 1;
+    resumeMetrics.totalLatencyMs += latencyMs;
+  } else {
+    resumeMetrics.failure += 1;
+    if (code === "RESUME_EXPIRED") {
+      resumeMetrics.timeoutExpired += 1;
+    }
+    const key = code || "UNKNOWN";
+    resumeMetrics.byCode.set(key, (resumeMetrics.byCode.get(key) || 0) + 1);
+  }
+}
+
+function getResumeMetricsSnapshot() {
+  const avgResumeLatencyMs =
+    resumeMetrics.success > 0
+      ? Math.round(resumeMetrics.totalLatencyMs / resumeMetrics.success)
+      : 0;
+  return {
+    attempts: resumeMetrics.attempts,
+    success: resumeMetrics.success,
+    failure: resumeMetrics.failure,
+    timeoutExpired: resumeMetrics.timeoutExpired,
+    avgResumeLatencyMs,
+    byCode: Object.fromEntries(resumeMetrics.byCode.entries()),
+  };
+}
+
+function getPlayerIdBySocket(room, socketId) {
+  if (!room?.players || !socketId) return null;
+  return (
+    Object.keys(room.players).find((pid) => room.players[pid]?.socketId === socketId) ||
+    null
+  );
+}
+
+function replacePlayerReferences(room, fromId, toId) {
+  if (!fromId || !toId || fromId === toId) return;
+  if (room.hostId === fromId) room.hostId = toId;
+  if (room.winner === fromId) room.winner = toId;
+  if (room.battle?.winner === fromId) room.battle.winner = toId;
+  if (room.battle?.aiHost?.claimedBy === fromId) room.battle.aiHost.claimedBy = toId;
+  if (room.shared?.turn === fromId) room.shared.turn = toId;
+}
+
+function disconnectTimerKey(roomId, playerId) {
+  return `${roomId}:${playerId}`;
+}
+
+function clearPendingDisconnect(roomId, playerId) {
+  if (!roomId || !playerId) return;
+  const key = disconnectTimerKey(roomId, playerId);
+  const timer = pendingDisconnectTimers.get(key);
+  if (timer) {
+    clearTimeout(timer);
+    pendingDisconnectTimers.delete(key);
+  }
+}
+
+function clearSharedRoomCloseTimer(roomId) {
+  if (!roomId) return;
+  const timer = pendingSharedCloseTimers.get(roomId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingSharedCloseTimers.delete(roomId);
+  }
+}
+
+function scheduleSharedRoomClose(roomId) {
+  if (!roomId) return;
+  clearSharedRoomCloseTimer(roomId);
+  const delayMs = sharedMode.SHARED_PARTNER_LEAVE_CLOSE_MS;
+  const timer = setTimeout(() => {
+    void closeSharedRoomDueToPartnerLeave(roomId);
+  }, delayMs);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  pendingSharedCloseTimers.set(roomId, timer);
+}
+
+async function closeSharedRoomDueToPartnerLeave(roomId) {
+  clearSharedRoomCloseTimer(roomId);
+  const room = await getRoom(roomId);
+  if (!room || room.mode !== "shared") return;
+  if (getActivePlayerIds(room).length >= 2) return;
+  if (!room.shared?.closingAt) return;
+
+  io.to(roomId).emit("roomClosed", { reason: "partner_left", roomId });
+  for (const pid of Object.keys(room.players || {})) {
+    clearPendingDisconnect(roomId, pid);
+  }
+  await deleteRoom(roomId);
+}
+
+function clearDuelRoomCloseTimer(roomId) {
+  if (!roomId) return;
+  const timer = pendingDuelCloseTimers.get(roomId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingDuelCloseTimers.delete(roomId);
+  }
+}
+
+function scheduleDuelRoomClose(roomId) {
+  if (!roomId) return;
+  clearDuelRoomCloseTimer(roomId);
+  const delayMs = duelMode.DUEL_PARTNER_LEAVE_CLOSE_MS;
+  const timer = setTimeout(() => {
+    void closeDuelRoomDueToPartnerLeave(roomId);
+  }, delayMs);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  pendingDuelCloseTimers.set(roomId, timer);
+}
+
+async function closeDuelRoomDueToPartnerLeave(roomId) {
+  clearDuelRoomCloseTimer(roomId);
+  const room = await getRoom(roomId);
+  if (!room || room.mode !== "duel") return;
+  if (getActivePlayerIds(room).length >= 2) return;
+  if (!room.duelLeave?.closingAt) return;
+
+  io.to(roomId).emit("roomClosed", { reason: "partner_left", roomId });
+  for (const pid of Object.keys(room.players || {})) {
+    clearPendingDisconnect(roomId, pid);
+  }
+  await deleteRoom(roomId);
+}
+
+function clearBattleHostLeaveTimer(roomId) {
+  if (!roomId) return;
+  const timer = pendingBattleHostLeaveTimers.get(roomId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingBattleHostLeaveTimers.delete(roomId);
+  }
+}
+
+function clearAbandonedRoomCloseTimer(roomId) {
+  if (!roomId) return;
+  const timer = pendingAbandonedCloseTimers.get(roomId);
+  if (timer) {
+    clearTimeout(timer);
+    pendingAbandonedCloseTimers.delete(roomId);
+  }
+}
+
+function scheduleAbandonedRoomClose(roomId, delayMs = ROOM_ABANDONED_CLOSE_MS) {
+  if (!roomId) return;
+  clearAbandonedRoomCloseTimer(roomId);
+  const timer = setTimeout(() => {
+    void closeAbandonedRoomIfEmpty(roomId);
+  }, delayMs);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  pendingAbandonedCloseTimers.set(roomId, timer);
+}
+
+async function closeAbandonedRoomIfEmpty(roomId) {
+  clearAbandonedRoomCloseTimer(roomId);
+  const room = await getRoom(roomId);
+  if (!room) return;
+  if (room.meta?.isEvent && isAiBattleEventActive()) return;
+  if (getActivePlayerIds(room).length > 0) return;
+
+  clearSharedRoomCloseTimer(roomId);
+  clearDuelRoomCloseTimer(roomId);
+  clearBattleHostLeaveTimer(roomId);
+  io.to(roomId).emit("roomClosed", { reason: "abandoned", roomId });
+  for (const pid of Object.keys(room.players || {})) {
+    clearPendingDisconnect(roomId, pid);
+  }
+  await deleteRoom(roomId);
+}
+
+function scheduleAbandonedCloseIfEmpty(room) {
+  if (!room?.id) return;
+  if (getActivePlayerIds(room).length > 0) return;
+  if (room.meta?.isEvent && isAiBattleEventActive()) return;
+  if (isRoomInProgress(room)) return;
+  scheduleAbandonedRoomClose(room.id, ROOM_ABANDONED_CLOSE_MS);
+}
+
+function scheduleBattleHostLeaveClose(roomId) {
+  if (!roomId) return;
+  clearBattleHostLeaveTimer(roomId);
+  const delayMs = battleMode.BATTLE_HOST_LEAVE_CLOSE_MS;
+  const timer = setTimeout(() => {
+    void closeBattleRoomDueToHostLeave(roomId);
+  }, delayMs);
+  if (typeof timer.unref === "function") {
+    timer.unref();
+  }
+  pendingBattleHostLeaveTimers.set(roomId, timer);
+}
+
+async function closeBattleRoomDueToHostLeave(roomId) {
+  clearBattleHostLeaveTimer(roomId);
+  const room = await getRoom(roomId);
+  if (!room || room.mode !== "battle") return;
+  if (!room.battle?.hostLeft?.closingAt) return;
+  const activeHostExists =
+    room.hostId &&
+    room.players?.[room.hostId] &&
+    !room.players[room.hostId].disconnected;
+  if (activeHostExists) return;
+
+  clearBattleRoundTimer(room);
+  io.to(roomId).emit("roomClosed", { reason: "host_left", roomId });
+  for (const pid of Object.keys(room.players || {})) {
+    clearPendingDisconnect(roomId, pid);
+  }
+  await deleteRoom(roomId);
+}
+
+async function maybeHandleBattleHostLeft(room, leftPlayerId) {
+  if (!room || room.mode !== "battle") return;
+  if (room.hostId !== leftPlayerId) return;
+  if (!battleMode.markBattleHostLeft(room, leftPlayerId)) return;
+
+  if (room.battle?.started) {
+    battleMode.endBattleRound(room, null, { updateStatsOnWin });
+    clearBattleRoundTimer(room);
+  }
+
+  scheduleBattleHostLeaveClose(room.id);
+  room.updatedAt = Date.now();
+  await saveRoom(room);
+  io.to(room.id).emit("roomState", sanitizeRoom(room));
+}
+
+async function maybeHandleDuelPartnerLeft(room, leftPlayerId) {
+  if (!room || room.mode !== "duel") return;
+  if (!duelMode.isDuelRoundEnded(room)) return;
+
+  const active = getActivePlayerIds(room);
+  if (active.length >= 2) {
+    if (room.duelLeave?.closingAt) {
+      duelMode.clearDuelPartnerLeft(room);
+      clearDuelRoomCloseTimer(room.id);
+      room.updatedAt = Date.now();
+      await saveRoom(room);
+      io.to(room.id).emit("roomState", sanitizeRoom(room));
+    }
+    return;
+  }
+
+  if (active.length !== 1) return;
+  if (!duelMode.markDuelPartnerLeft(room, leftPlayerId)) return;
+
+  scheduleDuelRoomClose(room.id);
+  room.updatedAt = Date.now();
+  await saveRoom(room);
+  io.to(room.id).emit("roomState", sanitizeRoom(room));
+}
+
+async function maybeHandleSharedPartnerLeft(room, leftPlayerId) {
+  if (!room || room.mode !== "shared" || !room.shared) return;
+
+  const active = getActivePlayerIds(room);
+  if (active.length >= 2) {
+    if (room.shared.closingAt) {
+      sharedMode.clearSharedPartnerLeft(room);
+      clearSharedRoomCloseTimer(room.id);
+      room.updatedAt = Date.now();
+      await saveRoom(room);
+      io.to(room.id).emit("roomState", sanitizeRoom(room));
+    }
+    return;
+  }
+
+  if (active.length !== 1) return;
+  // The remaining player cannot be the one who "left" (e.g. duplicate joinRoom resume).
+  if (active[0] === leftPlayerId) return;
+  if (!sharedMode.markSharedPartnerLeft(room, leftPlayerId)) return;
+
+  scheduleSharedRoomClose(room.id);
+  room.updatedAt = Date.now();
+  await saveRoom(room);
+  io.to(room.id).emit("roomState", sanitizeRoom(room));
+}
+
+async function markPlayerDisconnected(roomId, playerId, { expectedSocketId } = {}) {
+  const key = disconnectTimerKey(roomId, playerId);
+  pendingDisconnectTimers.delete(key);
+
+  const room = await getRoom(roomId);
+  if (!room) return;
+  const player = room.players[playerId];
+  if (!player) return;
+  if (player.disconnected) return;
+  if (
+    expectedSocketId != null &&
+    player.socketId != null &&
+    player.socketId !== expectedSocketId
+  ) {
+    return;
+  }
+
+  const now = Date.now();
+  player.disconnected = true;
+  player.disconnectedAt = now;
+  player.socketId = null;
+  void recordEventParticipationLeave(prisma, room, playerId, {
+    disconnected: true,
+  }).catch((err) => {
+    console.warn("[live-ops] disconnect telemetry failed", err.message);
+  });
+  sharedMode.handleSharedDisconnect(room, playerId);
+
+  if (room.hostId === playerId) {
+    if (room.mode === "battle_ai") {
+      if (room.meta?.isEvent) {
+        room.hostId = "server";
+        room.hostConnected = true;
+      } else {
+        room.hostId = null;
+        room.hostConnected = false;
+      }
+      if (room.battle?.aiHost) {
+        room.battle.aiHost.mode = "auto";
+        room.battle.aiHost.claimedBy = null;
+      }
+    } else if (room.mode === "battle") {
+      // Host transfer handled via maybeHandleBattleHostLeft.
+    } else {
+      const replacement = Object.keys(room.players).find(
+        (pid) => pid !== playerId && !room.players[pid].disconnected,
+      );
+      if (replacement) {
+        room.hostId = replacement;
+      }
+    }
+  }
+
+  room.updatedAt = now;
+  await saveRoom(room);
+  io.to(roomId).emit("roomState", sanitizeRoom(room));
+
+  if (room.mode === "shared") {
+    await maybeHandleSharedPartnerLeft(room, playerId);
+  }
+  if (room.mode === "duel") {
+    await maybeHandleDuelPartnerLeft(room, playerId);
+  }
+  if (room.mode === "battle") {
+    await maybeHandleBattleHostLeft(room, playerId);
+  }
+  if (room.mode === "battle_ai") {
+    const active = getActivePlayerIds(room);
+    if (active.length === 0) {
+      clearAiBattleTimers(room);
+      room.battle.deadline = null;
+      room.battle.countdownEndsAt = null;
+      battleMode.resetBattleRound(room);
+      room.battle.secret = null;
+      room.battle.lastRevealedWord = null;
+      if (room.meta?.isEvent && isAiBattleEventActive()) {
+        void ensureAiBattleEventRoom();
+      }
+    } else if (
+      room.battle.aiHost?.mode === "auto" &&
+      !room.battle.started &&
+      !room.battle.countdownEndsAt
+    ) {
+      void maybeEnsureAiBattleRound(roomId);
+    }
+  }
+
+  scheduleAbandonedCloseIfEmpty(room);
+}
+
+function scheduleDisconnectMark(roomId, playerId) {
+  if (!roomId || !playerId) return;
+  const key = disconnectTimerKey(roomId, playerId);
+  clearPendingDisconnect(roomId, playerId);
+  void (async () => {
+    const room = await getRoom(roomId);
+    const expectedSocketId = room?.players[playerId]?.socketId ?? null;
+    const timer = setTimeout(() => {
+      void markPlayerDisconnected(roomId, playerId, { expectedSocketId });
+    }, SOCKET_DISCONNECT_GRACE_MS);
+    if (typeof timer.unref === "function") {
+      timer.unref();
+    }
+    pendingDisconnectTimers.set(key, timer);
+  })();
+}
+
+async function disconnectStaleSocket(socketId) {
+  for (const id of await listRoomIds()) {
+    const room = await getRoom(id);
+    if (!room) continue;
+    const playerId = getPlayerIdBySocket(room, socketId);
+    if (!playerId) continue;
+    clearPendingDisconnect(id, playerId);
+    await markPlayerDisconnected(id, playerId, { expectedSocketId: socketId });
+  }
+  const sock = io.sockets.sockets.get(socketId);
+  if (sock) {
+    sock.disconnect(true);
+  }
+  socketHeartbeat.delete(socketId);
+}
+
+function updateStatsOnWin(room, winnerId) {
+  if (!winnerId || winnerId === "draw") return;
+  const player = room.players[winnerId];
+  if (!player) return;
+  player.wins = (player.wins || 0) + 1;
+  player.streak = (player.streak || 0) + 1;
+
+  Object.keys(room.players).forEach((id) => {
+    if (id !== winnerId) room.players[id].streak = 0;
+  });
+
+  if (room.mode === "duel" && player.userId) {
+    void processDuelWin(player.userId).catch((err) => {
+      console.warn("[progression] duel win failed", player.userId, err);
+    });
+  }
+}
+
+async function handleDuelTimeout(roomId) {
+  const room = await getRoom(roomId);
+  if (!room || room.mode !== "duel") return;
+  duelMode.resolveDuelTimeout({ room });
+  if (room.winner && room.winner !== "draw") {
+    updateStatsOnWin(room, room.winner);
+  } else if (room.winner === "draw") {
+    Object.keys(room.players).forEach((id) => {
+      room.players[id].streak = 0;
+    });
+  }
+  duelMode.clearDuelTimer(room);
+  await saveRoom(room);
+  io.to(roomId).emit("roomState", sanitizeRoom(room));
+}
+
+function isAiBattleRoom(room) {
+  return room?.mode === "battle_ai";
+}
+
+function pickAiBattleWord() {
+  const [word] = pickRandomWords(1);
+  if (word) return word;
+  if (WORDS.length === 0) return null;
+  const idx = Math.floor(Math.random() * WORDS.length);
+  return WORDS[idx] || null;
+}
+
+function clearBattleRoundTimer(room) {
+  if (room._battleRoundTimer) {
+    clearTimeout(room._battleRoundTimer);
+    room._battleRoundTimer = null;
+  }
+  room._battleRoundTimerDeadline = null;
+}
+
+function clearAiBattleTimers(room) {
+  if (room._aiBattleRoundTimer) {
+    clearTimeout(room._aiBattleRoundTimer);
+    room._aiBattleRoundTimer = null;
+  }
+  if (room._aiBattleCountdownTimer) {
+    clearTimeout(room._aiBattleCountdownTimer);
+    room._aiBattleCountdownTimer = null;
+  }
+  clearBattleRoundTimer(room);
+}
+
+async function handleBattleRoundTimeout(roomId, expectedDeadline = null) {
+  const room = await getRoom(roomId);
+  if (!room || room.mode !== "battle") return;
+  if (
+    expectedDeadline != null &&
+    (room._battleRoundTimerDeadline !== expectedDeadline ||
+      room.battle?.deadline !== expectedDeadline)
+  ) {
+    return;
+  }
+  room._battleRoundTimer = null;
+  room._battleRoundTimerDeadline = null;
+  if (!room.battle?.started) return;
+
+  battleMode.endBattleRound(room, null, { updateStatsOnWin });
+  await saveRoom(room);
+  io.to(roomId).emit("roomState", sanitizeRoom(room));
+}
+
+async function scheduleAiBattleCountdown(roomId) {
+  const room = await getRoom(roomId);
+  if (!room || !isAiBattleRoom(room)) return;
+  if (room.battle.aiHost?.mode !== "auto") return;
+  if (room.battle.pendingStart) return;
+  const active = getActivePlayerIds(room);
+  if (active.length === 0) {
+    clearAiBattleTimers(room);
+    room.battle.countdownEndsAt = null;
+    room.battle.deadline = null;
+    await saveRoom(room);
+    return;
+  }
+  if (room._aiBattleCountdownTimer) {
+    clearTimeout(room._aiBattleCountdownTimer);
+  }
+  const countdownEndsAt = Date.now() + AI_BATTLE_COUNTDOWN_MS;
+  room.battle.countdownEndsAt = countdownEndsAt;
+  room.updatedAt = Date.now();
+  await saveRoom(room);
+  room._aiBattleCountdownTimer = setTimeout(() => {
+    void (async () => {
+      room._aiBattleCountdownTimer = null;
+      const result = await autoStartAiBattleRound(roomId);
+      if (!result.ok) {
+        room.battle.pendingStart = true;
+        if (room.battle.aiHost) room.battle.aiHost.pendingStart = true;
+        await saveRoom(room);
+        io.to(roomId).emit("roomState", sanitizeRoom(room));
+      }
+    })();
+  }, AI_BATTLE_COUNTDOWN_MS);
+}
+
+async function autoStartAiBattleRound(roomId) {
+  const room = await getRoom(roomId);
+  if (!room || !isAiBattleRoom(room))
+    return { ok: false, error: "Room not available" };
+  if (room.battle.aiHost?.mode !== "auto")
+    return { ok: false, error: "AI host disabled" };
+  if (room.battle.started) return { ok: false, error: "Round already running" };
+  if (room.battle.pendingStart)
+    return { ok: false, error: "Start pending confirmation" };
+  if (room._aiBattleCountdownTimer) {
+    clearTimeout(room._aiBattleCountdownTimer);
+    room._aiBattleCountdownTimer = null;
+  }
+
+  const active = getActivePlayerIds(room);
+  if (active.length === 0) {
+    clearAiBattleTimers(room);
+    room.battle.deadline = null;
+    room.battle.countdownEndsAt = null;
+    return { ok: false, error: "No active players" };
+  }
+
+  const secret = pickAiBattleWord();
+  if (!secret) {
+    console.warn("[aiBattle] Unable to pick secret word");
+    return { ok: false, error: "No words available" };
+  }
+
+  battleMode.resetBattleRound(room);
+  room.battle.secret = secret;
+  room.battle.lastRevealedWord = null;
+  room.battle.countdownEndsAt = null;
+
+  const result = battleMode.startBattleRound({ room });
+  if (result?.error) {
+    console.warn("[aiBattle] startBattleRound failed", result.error);
+    return { ok: false, error: result.error };
+  }
+
+  room.battle.pendingStart = false;
+  if (room.battle.aiHost) room.battle.aiHost.pendingStart = false;
+  room.battle.deadline = Date.now() + AI_BATTLE_ROUND_MS;
+  room.updatedAt = Date.now();
+  if (room._aiBattleRoundTimer) {
+    clearTimeout(room._aiBattleRoundTimer);
+  }
+  room._aiBattleRoundTimer = setTimeout(() => {
+    void handleAiBattleTimeout(roomId);
+  }, AI_BATTLE_ROUND_MS);
+
+  await saveRoom(room);
+  io.to(roomId).emit("roomState", sanitizeRoom(room));
+  return { ok: true };
+}
+
+async function handleAiBattleTimeout(roomId) {
+  const room = await getRoom(roomId);
+  if (!room || !isAiBattleRoom(room)) return;
+  room._aiBattleRoundTimer = null;
+  if (!room.battle.started) return;
+
+  battleMode.endBattleRound(room, null, { updateStatsOnWin });
+  room.battle.deadline = null;
+  if (room.meta?.eventRetiring) {
+    await completeEventRetirementIfPending(room);
+    io.to(roomId).emit("roomState", sanitizeRoom(room));
+    return;
+  }
+  if (room.battle.aiHost?.mode === "player") {
+    room.battle.aiHost = { mode: "auto", claimedBy: null, pendingStart: false };
+    room.hostId = room.meta?.isEvent ? "server" : null;
+    room.hostConnected = room.meta?.isEvent ? true : false;
+  }
+  await saveRoom(room);
+  await scheduleAiBattleCountdown(roomId);
+  io.to(roomId).emit("roomState", sanitizeRoom(room));
+}
+
+async function maybeEnsureAiBattleRound(roomId) {
+  const room = await getRoom(roomId);
+  if (!room || !isAiBattleRoom(room)) return;
+  if (room.battle.aiHost?.mode !== "auto") return;
+  if (room.battle.started) return;
+
+  const active = getActivePlayerIds(room);
+  let touched = false;
+
+  if (active.length === 0) {
+    if (room.battle.countdownEndsAt || room.battle.deadline) {
+      clearAiBattleTimers(room);
+      room.battle.deadline = null;
+      room.battle.countdownEndsAt = null;
+      touched = true;
+    }
+    if (touched) {
+      await saveRoom(room);
+      io.to(roomId).emit("roomState", sanitizeRoom(room));
+    }
+    return;
+  }
+
+  if (room.battle.pendingStart) {
+    room.battle.pendingStart = false;
+    if (room.battle.aiHost) room.battle.aiHost.pendingStart = false;
+    touched = true;
+  }
+
+  if (!room.battle.countdownEndsAt && !room._aiBattleCountdownTimer) {
+    await scheduleAiBattleCountdown(roomId);
+    touched = true;
+  }
+
+  if (touched) {
+    await saveRoom(room);
+    io.to(roomId).emit("roomState", sanitizeRoom(room));
+  }
+}
+
+// ---------- HTTP + Socket.IO (same server) ----------
+const httpServer = createServer(app);
+// const io = new Server(httpServer, { cors: corsOptions });
+const io = new Server(httpServer, {
+  cors: {
+    origin: evaluateCorsOrigin,
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+  pingInterval: 10000, // send pings every 10s
+  pingTimeout: 30000, // allow 30s before declaring dead
+  allowEIO3: true, // helps older clients/proxies
+  perMessageDeflate: false, // avoid proxy compression issues
+});
+ioRef = io;
+
+async function broadcastRoomState(room) {
+  io.to(room.id).emit("roomState", sanitizeRoom(room));
+  void saveRoom(room).catch((err) => {
+    console.warn(
+      `[room-store] persist failed for room ${room?.id}:`,
+      err?.message || err,
+    );
+  });
+}
+
+/**
+ * Push an `equippedCosmetics` update to every live room the user currently
+ * participates in, so opponents see the change without rejoining. Best effort:
+ * errors are logged but don't reject the caller.
+ */
+async function pushCosmeticUpdateToLiveRooms(userId, equippedCosmetics) {
+  if (!userId || !equippedCosmetics) return;
+  try {
+    const roomIds = await listRoomIds();
+    for (const roomId of roomIds) {
+      const room = await getRoom(roomId);
+      if (!room || !room.players) continue;
+      let touched = false;
+      for (const player of Object.values(room.players)) {
+        if (player?.userId === userId) {
+          player.equippedCosmetics = equippedCosmetics;
+          touched = true;
+        }
+      }
+      if (touched) {
+        await broadcastRoomState(room);
+      }
+    }
+  } catch (error) {
+    console.warn(
+      "[cosmetics] pushCosmeticUpdateToLiveRooms failed:",
+      error?.message || error,
+    );
+  }
+}
+
+// ---------- Socket authentication middleware ----------
+io.use(authenticateSocket);
+
+if (!config.isTest) {
+  const interval = setInterval(() => {
+    const now = Date.now();
+    for (const [socketId, hb] of socketHeartbeat.entries()) {
+      if (now - hb.lastHeartbeatAt > HEARTBEAT_STALE_MS) {
+        console.warn(
+          `[heartbeat] stale socket=${socketId} ageMs=${now - hb.lastHeartbeatAt}`,
+        );
+        void disconnectStaleSocket(socketId);
+      }
+    }
+  }, HEARTBEAT_CHECK_INTERVAL_MS);
+  if (typeof interval.unref === "function") interval.unref();
+}
+
+// ---------- Socket helpers ----------
+
+async function getSocketProfileData(socket) {
+  if (!socket.userId) return {};
+  try {
+    const u = await prisma.user.findUnique({
+      where: { id: socket.userId },
+      select: {
+        profileAvatar: true,
+        profileColour: true,
+        equippedCosmetics: true,
+      },
+    });
+    return {
+      profileAvatar: u?.profileAvatar || null,
+      profileColour: u?.profileColour || null,
+      equippedCosmetics:
+        u?.equippedCosmetics && typeof u.equippedCosmetics === "object"
+          ? u.equippedCosmetics
+          : null,
+    };
+  } catch {
+    return {};
+  }
+}
+
+// ---------- Socket handlers ----------
+io.on("connection", (socket) => {
+  socketHeartbeat.set(socket.id, {
+    connectedAt: Date.now(),
+    lastHeartbeatAt: Date.now(),
+  });
+  logReconnect("connected", socket, { userId: socket.userId || null });
+  socket.conn?.on?.("packet", (packet) => {
+    if (packet?.type === "pong") {
+      const hb = socketHeartbeat.get(socket.id);
+      if (hb) hb.lastHeartbeatAt = Date.now();
+    }
+  });
+
+  socket.on("heartbeat", (payload, cb) => {
+    const ts = Number(payload?.ts);
+    const now = Date.now();
+    const hb = socketHeartbeat.get(socket.id);
+    if (hb) hb.lastHeartbeatAt = now;
+    const driftMs = Number.isFinite(ts) ? Math.abs(now - ts) : null;
+    const ok = driftMs == null || driftMs < 2 * 60 * 1000;
+    cb?.({ ok, serverTime: now, driftMs });
+  });
+
+  socket.on("syncRoom", async ({ roomId }, cb) => {
+    const sanitized = sanitizeRoomId(
+      typeof roomId === "string" ? roomId : roomId != null ? String(roomId) : "",
+    );
+    if (!sanitized) return cb?.({ ok: false, error: "Room not found" });
+    const room = await getRoom(sanitized);
+    if (!room) return cb?.({ ok: false, error: "Room not found" });
+    socket.join(sanitized);
+    cb?.({ ok: true, state: sanitizeRoom(room) });
+  });
+
+  socket.on("createRoom", async ({ name, mode = "duel", playerId }, cb) => {
+    if (!checkSocketRateLimit(socket.id, "createRoom", 5)) {
+      return cb?.({ error: "Too many rooms created. Slow down!" });
+    }
+    const sanitizedName = sanitizePlayerName(name);
+    if (!sanitizedName || !isSafeInput(sanitizedName)) {
+      return cb?.({ error: "Invalid name" });
+    }
+
+    const id = Math.random().toString(36).slice(2, 8).toUpperCase();
+    const normalizedMode = normalizeMode(mode);
+    const stablePlayerId = normalizePlayerId(playerId) || socket.id;
+    const initialHostId = normalizedMode === "battle_ai" ? null : stablePlayerId;
+    const now = Date.now();
+    const room = {
+      id,
+      mode: normalizedMode,
+      hostId: initialHostId,
+      players: {},
+      started: false,
+      winner: null,
+      duelReveal: undefined,
+      duelDeadline: null,
+      roundClosed: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    duelMode.initDuelRoom(room);
+    sharedMode.initSharedRoom(room, { pickRandomWords });
+    battleMode.initBattleRoom(room);
+    const liveOpsContext = getActiveEventForMode(normalizedMode);
+    if (liveOpsContext) {
+      tagRoomWithLiveOpsEvent(room, liveOpsContext);
+    }
+    if (normalizedMode === "battle_ai") {
+      room.hostId = null;
+      room.battle.pendingStart = false;
+      room.battle.aiHost = {
+        mode: "auto",
+        claimedBy: null,
+        pendingStart: false,
+      };
+    }
+
+    const profile = await getSocketProfileData(socket);
+    room.players[stablePlayerId] = {
+      playerId: stablePlayerId,
+      socketId: socket.id,
+      userId: socket.userId || null,
+      name: sanitizedName,
+      ready: false,
+      secret: null,
+      guesses: [],
+      done: false,
+      wins: 0,
+      streak: 0,
+      disconnected: false,
+      rematchRequested: false,
+      disconnectedAt: null,
+      ...profile,
+    };
+
+    await saveRoom(room);
+    void recordEventParticipationJoin(prisma, room, stablePlayerId).catch((err) => {
+      console.warn("[live-ops] join telemetry failed", err.message);
+    });
+    clearAbandonedRoomCloseTimer(id);
+    socket.join(id);
+    void syncDisplayNameForUser(socket.userId, sanitizedName);
+    if (normalizedMode === "battle_ai") {
+      await scheduleAiBattleCountdown(id);
+    }
+    cb?.({ roomId: id });
+    await broadcastRoomState(room);
+  });
+
+  socket.on("joinRoom", async ({ name, roomId, playerId }, cb) => {
+    if (!checkSocketRateLimit(socket.id, "joinRoom", 10)) {
+      return cb?.({ error: "Too many join attempts. Slow down!" });
+    }
+    const sanitizedRoomId = sanitizeRoomId(roomId);
+    const sanitizedName = sanitizePlayerName(name);
+
+    if (!sanitizedRoomId) {
+      return cb?.({ error: "Invalid room ID" });
+    }
+    if (!sanitizedName || !isSafeInput(sanitizedName)) {
+      return cb?.({ error: "Invalid name" });
+    }
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) return cb?.({ error: "Room not found" });
+
+    const stablePlayerId = normalizePlayerId(playerId);
+    const knownPlayerId =
+      stablePlayerId && room.players[stablePlayerId] ? stablePlayerId : null;
+    const oldId = Object.keys(room.players).find(
+      (pid) =>
+        (room.players[pid].name || "").trim().toLowerCase() ===
+          sanitizedName.trim().toLowerCase() && room.players[pid].disconnected
+    );
+
+    if (knownPlayerId || oldId) {
+      const sourceId = knownPlayerId || oldId;
+      const targetId = stablePlayerId || sourceId;
+      const oldPlayer = room.players[sourceId];
+      clearPendingDisconnect(sanitizedRoomId, sourceId);
+      clearPendingDisconnect(sanitizedRoomId, targetId);
+      room.players[targetId] = {
+        ...oldPlayer,
+        playerId: targetId,
+        socketId: socket.id,
+        userId: socket.userId || oldPlayer.userId || null,
+        disconnected: false,
+        disconnectedAt: null,
+      };
+      if (sourceId !== targetId) {
+        replacePlayerReferences(room, sourceId, targetId);
+        delete room.players[sourceId];
+      }
+
+      if (
+        room.mode === "battle" &&
+        room.battle?.hostLeft?.leftPlayerId === targetId
+      ) {
+        clearBattleHostLeaveTimer(sanitizedRoomId);
+        battleMode.clearBattleHostLeft(room);
+        room.hostId = targetId;
+        room.hostConnected = true;
+      }
+
+      room.updatedAt = Date.now();
+
+      clearAbandonedRoomCloseTimer(sanitizedRoomId);
+      socket.join(sanitizedRoomId);
+      await broadcastRoomState(room);
+      void recordEventParticipationJoin(prisma, room, targetId).catch((err) => {
+        console.warn("[live-ops] resume telemetry failed", err.message);
+      });
+      if (room.mode === "shared" && getActivePlayerIds(room).length >= 2) {
+        await maybeHandleSharedPartnerLeft(room, targetId);
+      }
+      console.log(
+        `[room-recovery] join-room resume room=${sanitizedRoomId} player=${targetId} source=${sourceId}`,
+      );
+      if (room.mode === "battle_ai") {
+        await maybeEnsureAiBattleRound(sanitizedRoomId);
+        if (room.meta?.isEvent && isAiBattleEventActive()) {
+          void ensureAiBattleEventRoom();
+        }
+      }
+      void syncDisplayNameForUser(socket.userId, sanitizedName);
+      return cb?.({ ok: true, resumed: true, mode: room.mode });
+    }
+
+    if (room.mode === "duel") {
+      const allowDuel = duelMode.canJoinDuel(room);
+      if (allowDuel?.error) return cb?.(allowDuel);
+    }
+    if (room.mode === "shared") {
+      const allowShared = sharedMode.canJoinShared(room);
+      if (allowShared?.error) return cb?.(allowShared);
+    }
+    if (room.mode === "battle") {
+      const allowBattle = battleMode.canJoinBattle(room);
+      if (allowBattle?.error) return cb?.(allowBattle);
+    }
+
+    const joinProfile = await getSocketProfileData(socket);
+    const newPlayerId = stablePlayerId || socket.id;
+    clearPendingDisconnect(sanitizedRoomId, newPlayerId);
+    room.players[newPlayerId] = {
+      playerId: newPlayerId,
+      socketId: socket.id,
+      userId: socket.userId || null,
+      name: sanitizedName,
+      ready: false,
+      secret: null,
+      guesses: [],
+      done: false,
+      wins: 0,
+      streak: 0,
+      disconnected: false,
+      rematchRequested: false,
+      disconnectedAt: null,
+      ...joinProfile,
+    };
+    if (!room.meta?.isEvent) {
+      tagRoomWithLiveOpsEvent(room, getActiveEventForMode(room.mode));
+    }
+    room.updatedAt = Date.now();
+
+    clearAbandonedRoomCloseTimer(sanitizedRoomId);
+    socket.join(sanitizedRoomId);
+    void syncDisplayNameForUser(socket.userId, sanitizedName);
+    cb?.({ ok: true, resumed: false, mode: room.mode });
+    await broadcastRoomState(room);
+    void recordEventParticipationJoin(prisma, room, newPlayerId).catch((err) => {
+      console.warn("[live-ops] join telemetry failed", err.message);
+    });
+    if (room.mode === "battle_ai") {
+      await maybeEnsureAiBattleRound(sanitizedRoomId);
+      if (room.meta?.isEvent && isAiBattleEventActive()) {
+        void ensureAiBattleEventRoom();
+      }
+    }
+  });
+
+  socket.on("setSecret", async ({ roomId, secret }, cb) => {
+    // Sanitize inputs
+    const sanitizedRoomId = sanitizeRoomId(roomId);
+    const sanitizedSecret = sanitizeWord(secret);
+
+    if (!sanitizedRoomId) {
+      return cb?.({ error: "Invalid room ID" });
+    }
+    if (!sanitizedSecret || sanitizedSecret.length !== 5) {
+      return cb?.({ error: "Invalid secret word" });
+    }
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "duel") return cb?.({ error: "Wrong mode" });
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (!actorId) return cb?.({ error: "Player not in room" });
+
+    const result = duelMode.handleSetSecret({
+      room,
+      socketId: actorId,
+      secret: sanitizedSecret, // Use sanitized secret
+      isValidWord: isValidWordLocal,
+    });
+    if (result?.error) return cb?.(result);
+
+       if (result?.started) {
+      const startResult = duelMode.startDuelRound({
+        room,
+        roundMs: ROUND_MS,
+        scheduleTimeout: () =>
+          setTimeout(() => {
+            void handleDuelTimeout(sanitizedRoomId);
+          }, ROUND_MS),
+      });
+      if (startResult?.error) return cb?.(startResult);
+    }
+
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("makeGuess", async ({ roomId, guess }, cb) => {
+    if (!checkSocketRateLimit(socket.id, "makeGuess", 10)) {
+      return cb?.({ error: "Too many guesses. Slow down!" });
+    }
+    // Sanitize inputs
+    const sanitizedRoomId = sanitizeRoomId(roomId);
+    const sanitizedGuess = sanitizeWord(guess);
+
+    if (!sanitizedRoomId) {
+      return cb?.({ error: "Invalid room ID" });
+    }
+    if (!sanitizedGuess || sanitizedGuess.length !== 5) {
+      return cb?.({ error: "Invalid guess" });
+    }
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (!actorId) return cb?.({ error: "Player not in room" });
+
+    if (!isValidWordLocal(sanitizedGuess)) {
+      return cb?.({ error: "Invalid word" });
+    }
+
+    if (room.mode === "duel") {
+      const result = duelMode.handleDuelGuess({
+        room,
+        socketId: actorId,
+        guess: sanitizedGuess, // Use sanitized guess
+        scoreGuess,
+        updateStatsOnWin,
+        getOpponent,
+      });
+      if (result?.error) return cb?.(result);
+      if (result?.roundEnded) duelMode.clearDuelTimer(room);
+      if (result?.roundEnded) {
+        void recordEventMatchCompleted(prisma, room, {
+          winnerId: room.winner && room.winner !== "draw" ? room.winner : null,
+        }).catch((err) => {
+          console.warn("[live-ops] duel match telemetry failed", err.message);
+        });
+      }
+      await broadcastRoomState(room);
+      return cb?.({ ok: true, pattern: result?.pattern });
+    }
+
+    if (room.mode === "shared") {
+      const result = sharedMode.handleSharedGuess({
+        room,
+        socketId: actorId,
+        guess: sanitizedGuess, // Use sanitized guess
+        scoreGuess,
+        updateStatsOnWin,
+        getOpponent,
+      });
+      if (result?.error) return cb?.(result);
+      if (!room.shared?.started && (room.shared?.winner || room.winner)) {
+        void recordEventMatchCompleted(prisma, room, {
+          winnerId: room.shared?.winner && room.shared.winner !== "draw" ? room.shared.winner : null,
+        }).catch((err) => {
+          console.warn("[live-ops] shared match telemetry failed", err.message);
+        });
+      }
+      await broadcastRoomState(room);
+      return cb?.({ ok: true, pattern: result?.pattern });
+    }
+
+    if (room.mode === "battle" || room.mode === "battle_ai") {
+      const result = battleMode.handleBattleGuess({
+        room,
+        socketId: actorId,
+        guess: sanitizedGuess, // Use sanitized guess
+        scoreGuess,
+        updateStatsOnWin,
+      });
+      if (result?.error) return cb?.(result);
+      if (result?.ended) {
+        void recordEventMatchCompleted(prisma, room, {
+          winnerId: room.battle?.winner || null,
+        }).catch((err) => {
+          console.warn("[live-ops] battle match telemetry failed", err.message);
+        });
+        if (room.mode === "battle") {
+          clearBattleRoundTimer(room);
+        } else if (room.mode === "battle_ai") {
+          if (room._aiBattleRoundTimer) {
+            clearTimeout(room._aiBattleRoundTimer);
+            room._aiBattleRoundTimer = null;
+          }
+          room.battle.deadline = null;
+          if (room.battle.aiHost?.mode === "player") {
+            room.battle.aiHost = { mode: "auto", claimedBy: null, pendingStart: false };
+            room.hostId = room.meta?.isEvent ? "server" : null;
+            room.hostConnected = room.meta?.isEvent ? true : false;
+          }
+          if (room.meta?.eventRetiring) {
+            await completeEventRetirementIfPending(room);
+            await broadcastRoomState(room);
+            return cb?.({ ok: true, pattern: result?.pattern });
+          }
+          await scheduleAiBattleCountdown(sanitizedRoomId);
+        } else if (room.meta?.eventRetiring) {
+          await completeEventRetirementIfPending(room);
+        }
+      }
+      await broadcastRoomState(room);
+      return cb?.({ ok: true, pattern: result?.pattern });
+    }
+
+    return cb?.({ error: "Unsupported mode" });
+  });
+
+  socket.on("duelPlayAgain", async ({ roomId }, cb) => {
+    const room = await getRoom(roomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "duel" && room.mode !== "shared")
+      return cb?.({ error: "Wrong mode" });
+
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (actorId && room.players[actorId]) {
+      room.players[actorId].rematchRequested = true;
+    }
+
+    const playerIds = Object.keys(room.players);
+    const bothRequested =
+      playerIds.length > 0 &&
+      playerIds.every((pid) => room.players[pid].rematchRequested);
+
+    if (bothRequested) {
+      Object.values(room.players).forEach((p) => {
+        p.guesses = [];
+        p.done = false;
+        p.ready = false;
+        p.secret = null;
+        p.rematchRequested = false;
+      });
+      room.started = false;
+      room.winner = null;
+      room.duelReveal = undefined;
+      room.duelDeadline = null;
+      room.roundClosed = false;
+
+      if (room._duelTimer) {
+        clearTimeout(room._duelTimer);
+        room._duelTimer = null;
+      }
+
+      if (room.mode === "duel") {
+        duelMode.resetDuelRound(room);
+      } else {
+        sharedMode.resetSharedRound(room);
+      }
+    }
+
+    await broadcastRoomState(room);
+    cb?.({ ok: true, bothRequested });
+  });
+
+  socket.on("startShared", async ({ roomId }, cb) => {
+    const room = await getRoom(roomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "shared")
+      return cb?.({ error: "Room not found or wrong mode" });
+
+    const result = sharedMode.startSharedRound({
+      room,
+      socketId: getPlayerIdBySocket(room, socket.id),
+      pickRandomWords,
+    });
+    if (result?.error) return cb?.(result);
+
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("setHostWord", async ({ roomId, secret }, cb) => {
+    // Sanitize inputs
+    const sanitizedRoomId = sanitizeRoomId(roomId);
+    const sanitizedSecret = sanitizeWord(secret);
+
+    if (!sanitizedRoomId) {
+      return cb?.({ error: "Invalid room ID" });
+    }
+    if (!sanitizedSecret || sanitizedSecret.length !== 5) {
+      return cb?.({ error: "Invalid word" });
+    }
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle" && room.mode !== "battle_ai") {
+      return cb?.({ error: "Wrong mode" });
+    }
+    if (room.mode === "battle_ai") {
+      if (room.battle?.aiHost?.mode !== "player") {
+        return cb?.({ error: "AI host is active" });
+      }
+    }
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (actorId !== room.hostId)
+      return cb?.({ error: "Only host can set word" });
+
+    const result = battleMode.setHostWord({
+      room,
+      secret: sanitizedSecret,
+      validateWord: isValidWordLocal,
+    });
+    if (result?.error) return cb?.(result);
+
+    if (room.mode === "battle") {
+      clearBattleRoundTimer(room);
+    } else if (room.mode === "battle_ai") {
+      clearAiBattleTimers(room);
+    }
+
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("startBattle", async ({ roomId }, cb) => {
+    const room = await getRoom(roomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle" && room.mode !== "battle_ai") {
+      return cb?.({ error: "Wrong mode" });
+    }
+    if (room.mode === "battle_ai" && room.battle?.aiHost?.mode !== "player") {
+      return cb?.({ error: "AI host is active" });
+    }
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (actorId !== room.hostId)
+      return cb?.({ error: "Only host can start" });
+
+    const result = battleMode.startBattleRound({ room });
+    if (result?.error) return cb?.(result);
+
+    if (room.mode === "battle_ai") {
+      room.battle.lastRevealedWord = null;
+      room.battle.countdownEndsAt = null;
+      room.battle.deadline = Date.now() + AI_BATTLE_ROUND_MS;
+      if (room._aiBattleRoundTimer) {
+        clearTimeout(room._aiBattleRoundTimer);
+      }
+      room._aiBattleRoundTimer = setTimeout(() => {
+        void handleAiBattleTimeout(roomId);
+      }, AI_BATTLE_ROUND_MS);
+    } else if (room.mode === "battle") {
+      clearBattleRoundTimer(room);
+      const roundMs = room.battle.roundMs;
+      if (roundMs && roundMs > 0) {
+        const deadline = Date.now() + roundMs;
+        room.battle.deadline = deadline;
+        room._battleRoundTimerDeadline = deadline;
+        room._battleRoundTimer = setTimeout(() => {
+          void handleBattleRoundTimeout(room.id, deadline);
+        }, roundMs);
+      } else {
+        room.battle.deadline = null;
+        room._battleRoundTimerDeadline = null;
+      }
+    }
+
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("setBattleSettings", async ({ roomId, locked, maxGuesses, roundMs }, cb) => {
+    const sanitizedRoomId = sanitizeRoomId(roomId);
+    if (!sanitizedRoomId) return cb?.({ error: "Invalid room ID" });
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle") return cb?.({ error: "Wrong mode" });
+
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (actorId !== room.hostId) {
+      return cb?.({ error: "Only host can change settings" });
+    }
+
+    const result = battleMode.setBattleSettings({
+      room,
+      locked,
+      maxGuesses,
+      roundMs,
+      maxRoundMs: ROUND_MS,
+    });
+    if (result?.error) return cb?.(result);
+
+    room.updatedAt = Date.now();
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("battleKickPlayer", async ({ roomId, playerId }, cb) => {
+    const sanitizedRoomId = sanitizeRoomId(roomId);
+    if (!sanitizedRoomId) return cb?.({ error: "Invalid room ID" });
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle") return cb?.({ error: "Wrong mode" });
+
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (actorId !== room.hostId) {
+      return cb?.({ error: "Only host can kick players" });
+    }
+
+    const targetId =
+      typeof playerId === "string" && room.players[playerId]
+        ? playerId
+        : getPlayerIdBySocket(room, playerId);
+    if (!targetId) return cb?.({ error: "Player not in room" });
+
+    const result = battleMode.kickBattlePlayer({ room, playerId: targetId });
+    if (result?.error) return cb?.(result);
+
+    if (result.socketId) {
+      const targetSocket = io.sockets.sockets.get(result.socketId);
+      if (targetSocket) {
+        targetSocket.leave(sanitizedRoomId);
+        targetSocket.emit("kicked", {
+          roomId: sanitizedRoomId,
+          reason: "host_kick",
+          message: "You were removed from the room by the host",
+        });
+      }
+    }
+
+    room.updatedAt = Date.now();
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("claimBattleHost", async ({ roomId }, cb) => {
+    const sanitizedRoomId = sanitizeRoomId(roomId);
+    if (!sanitizedRoomId) return cb?.({ error: "Invalid room ID" });
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle") return cb?.({ error: "Wrong mode" });
+    if (!room.battle?.hostLeft?.closingAt) {
+      return cb?.({ error: "No host to claim" });
+    }
+
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    const player = actorId ? room.players[actorId] : null;
+    if (!player || player.disconnected) {
+      return cb?.({ error: "Not in room" });
+    }
+
+    clearBattleHostLeaveTimer(sanitizedRoomId);
+    clearBattleRoundTimer(room);
+    battleMode.resetBattleRound(room);
+    room.battle.secret = null;
+    room.battle.lastRevealedWord = null;
+    battleMode.clearBattleHostLeft(room);
+    room.hostId = actorId;
+    room.hostConnected = true;
+    room.updatedAt = Date.now();
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("aiBattleClaimHost", async ({ roomId }, cb) => {
+    const room = await getRoom(roomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle_ai") return cb?.({ error: "Wrong mode" });
+    if (room.battle?.aiHost?.mode === "player") {
+      return cb?.({ error: "Host already claimed" });
+    }
+    if (room.battle?.started) {
+      return cb?.({ error: "Wait for the round to finish first" });
+    }
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    const player = actorId ? room.players[actorId] : null;
+    if (!player || player.disconnected) {
+      return cb?.({ error: "Not in room" });
+    }
+
+    clearAiBattleTimers(room);
+    battleMode.resetBattleRound(room);
+    room.battle.secret = null;
+    room.battle.lastRevealedWord = null;
+    room.battle.aiHost = {
+      mode: "player",
+      claimedBy: actorId,
+      pendingStart: false,
+    };
+    room.hostId = actorId;
+    room.battle.countdownEndsAt = null;
+    room.battle.deadline = null;
+    room.battle.pendingStart = false;
+    room.updatedAt = Date.now();
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("aiBattleReleaseHost", async ({ roomId }, cb) => {
+    const room = await getRoom(roomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle_ai") return cb?.({ error: "Wrong mode" });
+    if (room.battle?.aiHost?.mode !== "player") {
+      return cb?.({ error: "No player host to release" });
+    }
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (room.battle.aiHost.claimedBy !== actorId) {
+      return cb?.({ error: "Only the claimed host can release" });
+    }
+    if (room.battle?.started) {
+      return cb?.({ error: "Wait for the round to finish first" });
+    }
+
+    clearAiBattleTimers(room);
+    battleMode.resetBattleRound(room);
+    room.battle.secret = null;
+    room.battle.lastRevealedWord = null;
+    room.battle.aiHost = { mode: "auto", claimedBy: null, pendingStart: false };
+    if (room.meta?.isEvent) {
+      room.hostId = "server";
+      room.hostConnected = true;
+    } else {
+      room.hostId = null;
+      room.hostConnected = false;
+    }
+    room.battle.countdownEndsAt = null;
+    room.battle.deadline = null;
+    room.battle.pendingStart = false;
+    room.updatedAt = Date.now();
+    await broadcastRoomState(room);
+    void maybeEnsureAiBattleRound(roomId);
+    cb?.({ ok: true });
+  });
+
+  socket.on("playAgain", async ({ roomId }, cb) => {
+    const room = await getRoom(roomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle" && room.mode !== "battle_ai") {
+      return cb?.({ error: "Wrong mode" });
+    }
+    if (room.mode === "battle_ai" && room.battle?.aiHost?.mode !== "player") {
+      return cb?.({ error: "AI host is active" });
+    }
+    const actorId = getPlayerIdBySocket(room, socket.id);
+    if (actorId !== room.hostId)
+      return cb?.({ error: "Only host can reset" });
+
+    battleMode.resetBattleRound(room);
+    if (room.mode === "battle_ai") {
+      room.battle.secret = null;
+      room.battle.lastRevealedWord = null;
+      room.battle.deadline = null;
+      room.battle.countdownEndsAt = null;
+      clearAiBattleTimers(room);
+    } else if (room.mode === "battle") {
+      clearBattleRoundTimer(room);
+    }
+    await broadcastRoomState(room);
+    cb?.({ ok: true });
+  });
+
+  socket.on("aiBattleStart", async ({ roomId }, cb) => {
+    const room = await getRoom(roomId);
+    if (!room) return cb?.({ error: "Room not found" });
+    if (room.mode !== "battle_ai") return cb?.({ error: "Wrong mode" });
+    if (room.battle.started) return cb?.({ error: "Round already running" });
+    if (room.battle.aiHost?.mode !== "auto") {
+      return cb?.({ error: "AI host not active" });
+    }
+
+    const active = getActivePlayerIds(room);
+    if (active.length === 0) return cb?.({ error: "No active players" });
+
+    const started = await autoStartAiBattleRound(roomId);
+    if (!started?.ok) {
+      room.battle.pendingStart = true;
+      if (room.battle.aiHost) room.battle.aiHost.pendingStart = true;
+      await broadcastRoomState(room);
+      return cb?.({
+        error: started?.error || "Unable to start round",
+      });
+    }
+    cb?.(started);
+  });
+
+  socket.on("resume", async ({ roomId, oldId, playerId }, cb) => {
+    const startedAt = Date.now();
+    const failResume = (error, code) => {
+      trackResumeResult({
+        ok: false,
+        code,
+        latencyMs: Date.now() - startedAt,
+      });
+      return resumeError(cb, error, code);
+    };
+    const sanitizedRoomId = sanitizeRoomId(
+      typeof roomId === "string" ? roomId : roomId != null ? String(roomId) : "",
+    );
+    if (!sanitizedRoomId) {
+      return failResume("Invalid room ID", "INVALID_ROOM_ID");
+    }
+
+    const room = await getRoom(sanitizedRoomId);
+    if (!room) {
+      return failResume("Room not found", "ROOM_NOT_FOUND");
+    }
+
+    let stablePlayerId = null;
+    const rawPlayerId = playerId;
+    if (
+      rawPlayerId !== undefined &&
+      rawPlayerId !== null &&
+      String(rawPlayerId).trim() !== ""
+    ) {
+      const trimmed = String(rawPlayerId).trim();
+      if (!isValidUuidPlayerId(trimmed)) {
+        return failResume("Invalid player id", "INVALID_PLAYER_ID");
+      }
+      stablePlayerId = trimmed;
+    }
+
+    if (!config.isTest && stablePlayerId && !socket.userId) {
+      return failResume(
+        "Authentication required to resume",
+        "AUTH_REQUIRED",
+      );
+    }
+
+    let sourceId = null;
+    if (stablePlayerId && room.players[stablePlayerId]) {
+      sourceId = stablePlayerId;
+    } else if (oldId && room.players[oldId]) {
+      sourceId = oldId;
+    } else if (oldId) {
+      sourceId = Object.keys(room.players).find(
+        (pid) => room.players[pid]?.socketId === oldId,
+      );
+    }
+
+    if (!sourceId) {
+      return failResume("Old session not found", "SESSION_NOT_FOUND");
+    }
+
+    const candidate = room.players[sourceId];
+    if (!candidate) {
+      return failResume("Old session not found", "SESSION_NOT_FOUND");
+    }
+
+    if (!candidate.disconnected) {
+      return failResume(
+        "Player session is still active",
+        "NOT_DISCONNECTED",
+      );
+    }
+
+    if (
+      candidate.disconnected &&
+      typeof candidate.disconnectedAt === "number" &&
+      Date.now() - candidate.disconnectedAt > RESUME_MAX_DISCONNECT_MS
+    ) {
+      return failResume(
+        "Reconnect window expired; join the room again",
+        "RESUME_EXPIRED",
+      );
+    }
+
+    if (stablePlayerId && candidate.playerId && candidate.playerId !== stablePlayerId) {
+      return failResume(
+        "Player id does not match this seat",
+        "PLAYER_MISMATCH",
+      );
+    }
+
+    const targetId = stablePlayerId || sourceId;
+    clearPendingDisconnect(sanitizedRoomId, sourceId);
+    clearPendingDisconnect(sanitizedRoomId, targetId);
+    room.players[targetId] = {
+      ...room.players[sourceId],
+      playerId: targetId,
+      socketId: socket.id,
+      disconnected: false,
+      disconnectedAt: null,
+    };
+    if (sourceId !== targetId) {
+      replacePlayerReferences(room, sourceId, targetId);
+      delete room.players[sourceId];
+    }
+    room.updatedAt = Date.now();
+
+    socket.join(sanitizedRoomId);
+    await broadcastRoomState(room);
+    if (room.mode === "shared" && getActivePlayerIds(room).length >= 2) {
+      await maybeHandleSharedPartnerLeft(room, targetId);
+    }
+    if (room.mode === "battle_ai") {
+      void maybeEnsureAiBattleRound(sanitizedRoomId);
+    }
+    trackResumeResult({
+      ok: true,
+      code: "OK",
+      latencyMs: Date.now() - startedAt,
+    });
+    console.log(
+      `[room-recovery] resume success room=${sanitizedRoomId} player=${targetId} source=${sourceId} latencyMs=${Date.now() - startedAt}`,
+    );
+    cb?.({ ok: true, mode: room.mode });
+  });
+
+  socket.on("leaveRoom", async ({ roomId } = {}, cb) => {
+    let handled = false;
+
+    const requested =
+      roomId != null && roomId !== "" ? sanitizeRoomId(roomId) : null;
+    const idsToScan =
+      requested != null ? (requested ? [requested] : []) : await listRoomIds();
+
+    for (const id of idsToScan) {
+      const room = await getRoom(id);
+      if (!room) continue;
+      const playerId = getPlayerIdBySocket(room, socket.id);
+      const player = playerId ? room.players[playerId] : null;
+      if (!player) continue;
+
+      clearPendingDisconnect(id, playerId);
+      await markPlayerDisconnected(id, playerId, {
+        expectedSocketId: player.socketId,
+      });
+
+      socket.leave(id);
+      const fresh = await getRoom(id);
+      if (fresh) {
+        io.to(id).emit("roomState", sanitizeRoom(fresh));
+      }
+      handled = true;
+    }
+
+    cb?.({ ok: handled });
+  });
+
+  socket.on("disconnect", (reason) => {
+    logReconnect("disconnected", socket, { reason });
+    socketHeartbeat.delete(socket.id);
+    clearSocketRateLimits(socket.id);
+    void (async () => {
+      for (const id of await listRoomIds()) {
+        const room = await getRoom(id);
+        if (!room) continue;
+        const playerId = getPlayerIdBySocket(room, socket.id);
+        const player = playerId ? room.players[playerId] : null;
+        if (!player) continue;
+        // Hold a short grace window before marking disconnected to avoid
+        // brief network blips causing immediate failover.
+        scheduleDisconnectMark(id, playerId);
+      }
+    })();
+  });
+});
+
+const roomCleanupInterval =
+  !config.isTest
+    ? startRoomCleanupInterval({
+        listRoomIds,
+        getRoom,
+        saveRoom,
+        deleteRoom,
+        clearPendingDisconnect,
+        clearAbandonedRoomCloseTimer,
+        clearAiBattleTimers,
+        duelMode,
+        battleMode,
+        maybeEnsureAiBattleRound,
+        isAiBattleEventActive,
+        onRoomDeleted: async (roomId) => {
+          clearSharedRoomCloseTimer(roomId);
+          clearDuelRoomCloseTimer(roomId);
+          clearBattleHostLeaveTimer(roomId);
+          io.to(roomId).emit("roomClosed", { reason: "abandoned", roomId });
+        },
+      })
+    : null;
+
+const aiBattleEventInterval =
+  isAiBattleEventActive() && !config.isTest
+    ? setInterval(
+        () => void ensureAiBattleEventRoom(),
+        AI_BATTLE_EVENT_INTERVAL_MS,
+      )
+    : null;
+
+if (isAiBattleEventActive()) {
+  void ensureAiBattleEventRoom();
+}
+// ---------- Helpers ----------
+function getOpponent(room, socketId) {
+  return Object.keys(room.players).find((id) => id !== socketId);
+}
+
+function sanitizeRoom(room) {
+  const players = Object.fromEntries(
+    Object.entries(room.players).map(([id, p]) => {
+      const {
+        name,
+        ready,
+        guesses,
+        done,
+        wins = 0,
+        streak = 0,
+        disconnected = false,
+        rematchRequested = false,
+        profileAvatar = null,
+        profileColour = null,
+        equippedCosmetics = null,
+      } = p;
+      return [
+        id,
+        {
+          id,
+          name,
+          ready,
+          guesses,
+          done,
+          wins,
+          streak,
+          disconnected,
+          rematchRequested,
+          profileAvatar,
+          profileColour,
+          equippedCosmetics,
+        },
+      ];
+    })
+  );
+
+  const battleSnapshot = battleMode.sanitizeBattle(room);
+  if (
+    battleSnapshot &&
+    !battleSnapshot.lastRevealedWord &&
+    !room.battle.started &&
+    room.roundClosed &&
+    room.battle.secret
+  ) {
+    battleSnapshot.lastRevealedWord = room.battle.secret;
+  }
+
+  const sharedSnapshot = sharedMode.sanitizeShared(room);
+
+  return {
+    id: room.id,
+    mode: room.mode,
+    hostId: room.hostId,
+    players,
+    started: room.started,
+    winner: room.winner,
+    duelReveal: room.duelReveal || undefined,
+    duelDeadline: room.duelDeadline ?? null,
+    duelLeave: duelMode.sanitizeDuelLeave(room),
+    battle: battleSnapshot,
+    shared: sharedSnapshot,
+    meta: room.meta?.isEvent
+      ? {
+          isEvent: true,
+          eventKey: room.meta.eventKey || null,
+          eventRunId: room.meta.eventRunId || null,
+          eventName: room.meta.eventName || null,
+          eventMode: room.meta.eventMode || null,
+          eventTheme: room.meta.eventTheme || null,
+          eventRules: room.meta.eventRules || null,
+          plannedEndAt: room.meta.plannedEndAt || null,
+          featured: Boolean(room.meta.featured),
+        }
+      : undefined,
+  };
+}
+
+// ---------- CORS rejection handler ----------
+app.use((err, req, res, next) => {
+  if (err.message && err.message.startsWith("CORS:")) {
+    console.warn(`CORS rejected: ${req.headers.origin}`);
+    if (Sentry.isInitialized()) {
+      Sentry.captureMessage(err.message, {
+        level: "warning",
+        extra: { origin: req.headers.origin, url: req.url },
+      });
+    }
+    res.status(403).json({ error: "Origin not allowed" });
+    return;
+  }
+  next(err);
+});
+
+// ---------- Sentry error handler (must be before other error handlers) ----------
+if (config.sentryDsn) {
+  Sentry.setupExpressErrorHandler(app);
+}
+
+// ---------- Catch-all route for client-side routing (production only) ----------
+if (config.isProduction) {
+  app.get("*", (req, res) => {
+    const clientDistPath = path.join(__dirname, "..", "client", "dist");
+    res.sendFile(path.join(clientDistPath, "index.html"));
+  });
+}
+
+// ---------- Start server ----------
+const PORT = config.port;
+
+if (!config.isTest) {
+  try {
+    httpServer.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server listening on ${PORT}`);
+      console.log(`Word lists loaded: ${WORDSET.size} solutions, ${GUESSSET.size} total guesses`);
+      startSessionCleanup();
+    });
+  } catch (error) {
+    console.error("Server startup failed:", error.message);
+    process.exit(1);
+  }
+}
+
+export { httpServer };

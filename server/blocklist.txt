@@ -1,0 +1,27 @@
+# Blocked 5-letter words — not used as solutions or allowed guesses.
+# One word per line. Lines starting with # are ignored.
+# Restart server after edits (or POST /api/reload-words in dev).
+
+# Profanity / sexual
+FUCKS
+COCKS
+CUNTS
+PENIS
+SEMEN
+SPERM
+BOOBS
+WHORE
+SLUTS
+RAPED
+RAPES
+ANALS
+
+# Slurs / hate (5-letter forms only)
+NEGRO
+NIGER
+SPICS
+GOOKS
+KIKES
+DYKES
+FAGOT
+FAGGY

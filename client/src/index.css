@@ -1,0 +1,532 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer utilities {
+  .btn-success {
+    background-color: var(--btn-success-bg);
+    color: var(--btn-success-fg);
+    border: 1px solid var(--btn-success-bg);
+  }
+  .btn-success:hover:not(:disabled) {
+    background-color: var(--btn-success-bg-hover);
+    border-color: var(--btn-success-bg-hover);
+  }
+  .btn-danger {
+    background-color: var(--btn-danger-bg);
+    color: var(--btn-danger-fg);
+    border: 1px solid var(--btn-danger-bg);
+  }
+  .btn-danger:hover:not(:disabled) {
+    background-color: var(--btn-danger-bg-hover);
+    border-color: var(--btn-danger-bg-hover);
+  }
+
+}
+
+@layer base {
+  :root {
+    /* shadcn — dark only */
+    --background: 240 6% 4%;
+    --foreground: 0 0% 98%;
+    --card: 240 4% 10%;
+    --card-foreground: 0 0% 98%;
+    --popover: 240 4% 10%;
+    --popover-foreground: 0 0% 98%;
+    --primary: 0 0% 98%;
+    --primary-foreground: 240 6% 10%;
+    --secondary: 240 4% 16%;
+    --secondary-foreground: 0 0% 98%;
+    --muted: 240 4% 16%;
+    --muted-foreground: 240 5% 65%;
+    --accent: 240 4% 16%;
+    --accent-foreground: 0 0% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+    --border: 240 4% 16%;
+    --input: 240 4% 16%;
+    --ring: 240 5% 65%;
+    --chart-1: 220 70% 50%;
+    --chart-2: 160 60% 45%;
+    --chart-3: 30 80% 55%;
+    --chart-4: 280 65% 60%;
+    --chart-5: 340 75% 55%;
+    --radius: 0.5rem;
+
+    /* EvoWordo — competitive neon minimal (dark only) */
+    --app-bg: #090a0c;
+    --app-bg-glow: radial-gradient(
+      ellipse 120% 80% at 50% -20%,
+      rgba(56, 189, 248, 0.04),
+      transparent 55%
+    );
+    --surface: #141417;
+    --surface-elevated: #1a1a1e;
+    --border-subtle: #27272a;
+
+    /* Board tiles — empty quiet, feedback loud */
+    --tile-empty-bg: #0f1114;
+    --tile-empty-border: rgba(63, 63, 70, 0.38);
+    --tile-typed-bg: #16181c;
+    --tile-text: #f4f4f5;
+    --tile-active-row-border: rgba(113, 113, 122, 0.5);
+    --tile-active-row-shadow: 0 0 0 1px rgba(161, 161, 170, 0.12),
+      0 0 14px rgba(56, 189, 248, 0.06);
+
+    --tile-correct-bg: #5a9e56;
+    --tile-correct-fg: #ffffff;
+    --tile-correct-bg-hover: #4d8f49;
+
+    /* Semantic buttons */
+    --btn-success-bg: var(--tile-correct-bg);
+    --btn-success-fg: var(--tile-correct-fg);
+    --btn-success-bg-hover: var(--tile-correct-bg-hover);
+    --btn-danger-bg: #dc2626;
+    --btn-danger-fg: #ffffff;
+    --btn-danger-bg-hover: #b91c1c;
+    --tile-present-bg: #b8a04a;
+    --tile-present-fg: #ffffff;
+    --tile-absent-bg: #52525b;
+    --tile-absent-fg: #e4e4e7;
+
+    /* Keyboard — supports board, lower contrast idle keys */
+    --key-correct-bg: var(--tile-correct-bg);
+    --key-correct-fg: var(--tile-correct-fg);
+    --key-correct-border: var(--tile-correct-bg);
+    --key-present-bg: var(--tile-present-bg);
+    --key-present-fg: var(--tile-present-fg);
+    --key-present-border: var(--tile-present-bg);
+    --key-absent-bg: var(--tile-absent-bg);
+    --key-absent-fg: var(--tile-absent-fg);
+    --key-absent-border: var(--tile-absent-bg);
+    --key-idle-bg: #27272a;
+    --key-idle-fg: #d4d4d8;
+    --key-idle-border: #3f3f46;
+
+    /* In-game glass surfaces */
+    --glass-bg: rgba(20, 20, 23, 0.42);
+    --glass-border: rgba(63, 63, 70, 0.32);
+    --glass-blur: 16px;
+
+    --card-bg: #18181b;
+    --card-border: #27272a;
+    --card-text: #fafafa;
+    --card-text-muted: #a1a1aa;
+    --card-hover: #27272a;
+
+    --kbd-idle-bg: #565758;
+    --kbd-idle-fg: #fff;
+    --kbd-idle-border: #3a3a3c;
+
+    --scrollbar-thumb: #3f3f46;
+    --scrollbar-thumb-hover: #52525b;
+  }
+
+  html[data-tile-theme="colorblind"] {
+    --tile-correct-bg: #0077b6;
+    --tile-correct-bg-hover: #005f8f;
+    --tile-present-bg: #e85d04;
+    --tile-present-fg: #ffffff;
+    --tile-absent-bg: #4a4e69;
+  }
+
+  /* ===== Cosmetic board themes (profile unlocks) =====
+     Tier 1: tile palette + optional pseudo-element board backdrop.
+
+     RULE: Cosmetic themes ONLY style the UNFLIPPED face of tiles
+     (--tile-empty-*, --tile-typed-*, --tile-text). The flipped/revealed
+     face (--tile-correct-*, --tile-present-*, --tile-absent-*) always
+     uses the standard Wordle green / yellow / gray scheme defined in
+     :root above. This keeps feedback colors unambiguous regardless of
+     cosmetic choices.
+
+     Phase 2 (per-row animations) lives in docs/COSMETICS_ROADMAP.md.
+  */
+
+  /* Any theme/font wrapper that sets --board-font applies it to children. */
+  [class*="theme-"],
+  [class*="font-pack-"] {
+    font-family: var(--board-font, inherit);
+    /* Feedback keys mirror tiles; untried keys use empty tile face (not absent). */
+    --key-correct-bg: var(--tile-correct-bg);
+    --key-correct-fg: var(--tile-correct-fg);
+    --key-correct-border: var(--tile-correct-bg);
+    --key-present-bg: var(--tile-present-bg);
+    --key-present-fg: var(--tile-present-fg);
+    --key-present-border: var(--tile-present-bg);
+    --key-absent-bg: var(--tile-absent-bg);
+    --key-absent-fg: var(--tile-absent-fg);
+    --key-absent-border: var(--tile-absent-bg);
+    --key-idle-bg: var(--tile-empty-bg);
+    --key-idle-fg: var(--tile-text);
+    --key-idle-border: var(--tile-empty-border);
+  }
+
+  .board-shell {
+    box-sizing: border-box;
+  }
+
+  /* Two finalized board skins — gameplay feedback colors stay on :root */
+  .theme-classic {
+    --tile-empty-bg: #0f1114;
+    --tile-empty-border: rgba(63, 63, 70, 0.38);
+    --tile-typed-bg: #16181c;
+    --tile-text: #f4f4f5;
+    --tile-active-row-border: rgba(113, 113, 122, 0.5);
+    --tile-active-row-shadow: 0 0 0 1px rgba(161, 161, 170, 0.12),
+      0 0 14px rgba(56, 189, 248, 0.06);
+  }
+
+  .theme-neon-slate {
+    --tile-empty-bg: #0c1016;
+    --tile-empty-border: rgba(71, 85, 105, 0.32);
+    --tile-typed-bg: #131820;
+    --tile-text: #f1f5f9;
+    --tile-active-row-border: rgba(56, 189, 248, 0.28);
+    --tile-active-row-shadow: 0 0 0 1px rgba(56, 189, 248, 0.1),
+      0 0 16px rgba(56, 189, 248, 0.08);
+    position: relative;
+  }
+  .theme-neon-slate::before {
+    content: "";
+    position: absolute;
+    inset: -5%;
+    pointer-events: none;
+    background: radial-gradient(
+      ellipse at 50% 110%,
+      rgba(56, 189, 248, 0.05),
+      transparent 58%
+    );
+    z-index: 0;
+  }
+
+  /* Legacy theme class names — quiet tiles only (no decorative backgrounds) */
+  .theme-aurora,
+  .theme-liquid-mercury,
+  .theme-stained-glass,
+  .theme-origami,
+  .theme-retro-arcade,
+  .theme-ninja-village,
+  .theme-cyber-synthwave,
+  .theme-trading-card,
+  .theme-botanical-garden,
+  .theme-ceramic,
+  .theme-library-inkwell,
+  .theme-championship-gold,
+  .theme-volcanic,
+  .theme-constellation,
+  .theme-seasonal-cherry-blossom,
+  .theme-seasonal-snowglobe {
+    --tile-empty-bg: #0f1114;
+    --tile-empty-border: rgba(63, 63, 70, 0.38);
+    --tile-typed-bg: #16181c;
+    --tile-text: #f4f4f5;
+    --tile-active-row-border: rgba(113, 113, 122, 0.5);
+    --tile-active-row-shadow: 0 0 0 1px rgba(161, 161, 170, 0.12),
+      0 0 14px rgba(56, 189, 248, 0.06);
+    background-image: none;
+    animation: none;
+  }
+
+  /* ===== Font packs ==================================================== */
+
+  .font-pack-mono {
+    --board-font: '"JetBrains Mono", "Courier New", monospace';
+  }
+  .font-pack-brush {
+    --board-font: '"Bradley Hand", "Brush Script MT", "Comic Sans MS", cursive';
+  }
+  .font-pack-art-deco {
+    --board-font: '"Cormorant Garamond", "Bodoni 72", Georgia, serif';
+  }
+  .font-pack-pixel {
+    --board-font: '"Press Start 2P", "VT323", monospace';
+  }
+}
+
+html[data-reduced-motion="true"] *,
+html[data-reduced-motion="true"] *::before,
+html[data-reduced-motion="true"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+    background-color: var(--app-bg);
+    background-image: var(--app-bg-glow);
+    background-attachment: fixed;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track, var(--app-bg));
+  }
+
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  *::-webkit-scrollbar-track {
+    background: var(--scrollbar-track, var(--app-bg));
+  }
+
+  *::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar-thumb);
+    border-radius: 9999px;
+    border: 2px solid var(--scrollbar-track, var(--app-bg));
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scrollbar-thumb-hover);
+  }
+
+  *::-webkit-scrollbar-corner {
+    background: var(--scrollbar-track, var(--app-bg));
+  }
+}
+
+@layer utilities {
+  .glass-panel {
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    backdrop-filter: blur(var(--glass-blur));
+    -webkit-backdrop-filter: blur(var(--glass-blur));
+  }
+
+  .scrollbar-match {
+    scrollbar-width: thin;
+    scrollbar-color: var(--scrollbar-thumb, #3f3f46) var(--scrollbar-track, var(--app-bg, #0b0c0e));
+  }
+
+  .scrollbar-track-app {
+    --scrollbar-track: var(--app-bg, #0b0c0e);
+  }
+
+  .scrollbar-track-slate {
+    --scrollbar-track: #0f172a;
+  }
+
+  .scrollbar-track-panel {
+    --scrollbar-track: #12121f;
+  }
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+
+@keyframes shakeX {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  10% {
+    transform: translateX(-6px);
+  }
+  20% {
+    transform: translateX(6px);
+  }
+  30% {
+    transform: translateX(-5px);
+  }
+  40% {
+    transform: translateX(5px);
+  }
+  50% {
+    transform: translateX(-3px);
+  }
+  60% {
+    transform: translateX(3px);
+  }
+  70% {
+    transform: translateX(-2px);
+  }
+  80% {
+    transform: translateX(2px);
+  }
+}
+
+@keyframes flashRed {
+  0%,
+  100% {
+    background-color: transparent;
+  }
+  50% {
+    background-color: rgba(239, 68, 68, 0.3);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes cursor-trail-fade {
+  0% {
+    opacity: 0.85;
+    transform: scale(1);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0.4);
+  }
+}
+
+/* Violent shake */
+@keyframes guess-shake {
+  10% { transform: translateX(-6px); }
+  20% { transform: translateX(6px); }
+  30% { transform: translateX(-5px); }
+  40% { transform: translateX(5px); }
+  50% { transform: translateX(-4px); }
+  60% { transform: translateX(4px); }
+  70% { transform: translateX(-3px); }
+  80% { transform: translateX(3px); }
+  90% { transform: translateX(-2px); }
+  100% { transform: translateX(0); }
+}
+
+.shake-hard {
+  animation: guess-shake 0.6s ease both;
+}
+
+.shake-hard > div {
+  animation: shakeX 400ms ease-in-out;
+}
+
+/* Tile flip animation for word reveal */
+@keyframes tileFlip {
+  0% { 
+    transform: rotateY(0deg) scale(1);
+    background-color: var(--tile-empty-bg);
+    color: var(--tile-text);
+  }
+  50% { 
+    transform: rotateY(90deg) scale(1.1);
+    background-color: var(--tile-typed-bg);
+    color: var(--tile-text);
+  }
+  100% { 
+    transform: rotateY(0deg) scale(1);
+    background-color: var(--tile-correct-bg);
+    color: var(--tile-correct-fg);
+    border: 1px solid var(--tile-correct-bg);
+  }
+}
+
+/* Base flip animation with compress + bounce physics */
+@keyframes tileFlipBase {
+  0%   { transform: rotateY(0deg) scale(1); }
+  10%  { transform: rotateY(0deg) scale(0.95); }
+  50%  { transform: rotateY(90deg) scale(1.05); }
+  85%  { transform: rotateY(0deg) scale(1.03); }
+  100% { transform: rotateY(0deg) scale(1); }
+}
+
+/* Color transitions for different tile states */
+@keyframes tileFlipToGreen {
+  0% {
+    background-color: var(--tile-empty-bg);
+    color: var(--tile-text);
+    border: 1px solid var(--tile-empty-border);
+  }
+  45% {
+    background-color: var(--tile-typed-bg);
+    color: var(--tile-text);
+    border: 1px solid var(--tile-empty-border);
+  }
+  55% {
+    background-color: var(--tile-correct-bg);
+    color: var(--tile-correct-fg);
+    border: 1px solid var(--tile-correct-bg);
+  }
+  100% {
+    background-color: var(--tile-correct-bg);
+    color: var(--tile-correct-fg);
+    border: 1px solid var(--tile-correct-bg);
+  }
+}
+
+@keyframes tileFlipToYellow {
+  0% {
+    background-color: var(--tile-empty-bg);
+    color: var(--tile-text);
+    border: 1px solid var(--tile-empty-border);
+  }
+  45% {
+    background-color: var(--tile-typed-bg);
+    color: var(--tile-text);
+    border: 1px solid var(--tile-empty-border);
+  }
+  55% {
+    background-color: var(--tile-present-bg);
+    color: var(--tile-present-fg);
+    border: 1px solid var(--tile-present-bg);
+  }
+  100% {
+    background-color: var(--tile-present-bg);
+    color: var(--tile-present-fg);
+    border: 1px solid var(--tile-present-bg);
+  }
+}
+
+@keyframes tileFlipToGray {
+  0% {
+    background-color: var(--tile-empty-bg);
+    color: var(--tile-text);
+    border: 1px solid var(--tile-empty-border);
+  }
+  45% {
+    background-color: var(--tile-typed-bg);
+    color: var(--tile-text);
+    border: 1px solid var(--tile-empty-border);
+  }
+  55% {
+    background-color: var(--tile-absent-bg);
+    color: var(--tile-absent-fg);
+    border: 1px solid var(--tile-absent-bg);
+  }
+  100% {
+    background-color: var(--tile-absent-bg);
+    color: var(--tile-absent-fg);
+    border: 1px solid var(--tile-absent-bg);
+  }
+}
+
+/* Error styling for tiles in the active row */
+.tile-error {
+  border-color: hsl(var(--destructive)) !important;
+  color: hsl(var(--destructive)) !important;
+  box-shadow: inset 0 0 0 2px #ef4444;
+  animation: flashRed 300ms ease-in-out;
+}
+
+/* Accessibility: respect user's reduced-motion preference */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+

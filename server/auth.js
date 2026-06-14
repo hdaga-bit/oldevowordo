@@ -1,0 +1,417 @@
+import * as client from "openid-client";
+import { Strategy } from "openid-client/passport";
+import passport from "passport";
+import session from "express-session";
+import connectPg from "connect-pg-simple";
+import memoize from "memoizee";
+import { PrismaClient } from "@prisma/client";
+import {
+  mergeAnonymousUser,
+  mergeAnonymousUserIntoExisting,
+} from "./mergeService.js";
+import { config as envConfig } from "./config/env.js";
+
+const prisma = new PrismaClient();
+
+// Store session store reference for socket authentication
+let sessionStoreRef = null;
+
+if (!envConfig.replitDomains) {
+  console.warn("REPLIT_DOMAINS not set - auth may not work in deployment");
+}
+
+const DEFAULT_FRONTEND_URL = envConfig.baseUrl;
+
+const getOidcConfig = memoize(
+  async () => {
+    return await client.discovery(
+      new URL(envConfig.issuerUrl),
+      envConfig.replId,
+      { client_secret: envConfig.googleClientSecret }
+    );
+  },
+  { maxAge: 3600 * 1000 }
+);
+
+export function getSession() {
+  const sessionTtl = 7 * 24 * 60 * 60 * 1000; // 1 week
+  const pgStore = connectPg(session);
+  const sessionStore = new pgStore({
+    conString: envConfig.databaseUrl,
+    createTableIfMissing: true,
+    ttl: sessionTtl,
+    tableName: "user_sessions", // Different from our Session model to avoid conflicts
+  });
+  
+  // Store reference for socket authentication
+  sessionStoreRef = sessionStore;
+
+  const sessionSecret = envConfig.sessionSecret;
+  if (!sessionSecret) {
+    if (envConfig.isProduction) {
+      throw new Error(
+        "SESSION_SECRET must be set in production. Refusing to start with an insecure default."
+      );
+    } else {
+      console.warn(
+        "[session] SESSION_SECRET not set. Falling back to insecure development secret."
+      );
+    }
+  }
+
+  return session({
+    secret: sessionSecret || "dev-secret-change-in-production",
+    store: sessionStore,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: envConfig.isProduction,
+      sameSite:
+        envConfig.sessionCookieSameSite ||
+        (envConfig.isProduction ? "none" : "lax"),
+      domain: envConfig.sessionCookieDomain,
+      maxAge: sessionTtl,
+    },
+  });
+}
+
+function updateUserSession(user, tokens) {
+  user.claims = tokens.claims();
+  user.access_token = tokens.access_token;
+  user.refresh_token = tokens.refresh_token;
+  user.expires_at = user.claims?.exp;
+}
+
+function resolveFrontendRedirect(req) {
+  const defaultTarget = DEFAULT_FRONTEND_URL;
+  const candidate = req.query.redirect || req.get("referer");
+
+  if (!candidate) {
+    return defaultTarget;
+  }
+
+  try {
+    const resolved = new URL(candidate, defaultTarget);
+    const defaultOrigin = new URL(defaultTarget).origin;
+    if (resolved.origin === defaultOrigin) {
+      return resolved.toString();
+    }
+  } catch (error) {
+    console.warn("[AUTH] Ignoring invalid redirect target", candidate, error);
+  }
+
+  return defaultTarget;
+}
+
+async function upsertAuthenticatedUser(claims, anonymousUserId) {
+  const authExternalId = claims["sub"];
+
+  // Check if this Replit user already exists
+  let user = await prisma.user.findUnique({
+    where: { authExternalId },
+  });
+
+  if (user) {
+    // User exists - check if they have new anonymous progress to merge
+    if (anonymousUserId && anonymousUserId !== user.id) {
+      const anonUser = await prisma.user.findUnique({
+        where: { id: anonymousUserId },
+      });
+
+      if (anonUser && anonUser.isAnonymous) {
+        // Merge anonymous progress into existing authenticated account
+        console.log(
+          `[AUTH] Merging anonymous user ${anonymousUserId} into existing account ${user.id}`
+        );
+        await mergeAnonymousUserIntoExisting(anonymousUserId, user.id);
+      }
+    }
+
+    // Update account info
+    return await prisma.user.update({
+      where: { id: user.id },
+      data: {
+        email: claims["email"],
+        displayName:
+          `${claims["first_name"] || ""} ${claims["last_name"] || ""}`.trim() ||
+          null,
+        avatarUrl: claims["profile_image_url"],
+        isAnonymous: false,
+      },
+    });
+  }
+
+  // New authenticated user - check if we need to merge anonymous account
+  if (anonymousUserId) {
+    const anonUser = await prisma.user.findUnique({
+      where: { id: anonymousUserId },
+    });
+
+    if (anonUser && anonUser.isAnonymous) {
+      // Merge the anonymous user into the new authenticated user
+      user = await mergeAnonymousUser(anonymousUserId, {
+        authProvider: "replit",
+        authExternalId,
+        email: claims["email"],
+        displayName:
+          `${claims["first_name"] || ""} ${claims["last_name"] || ""}`.trim() ||
+          null,
+        avatarUrl: claims["profile_image_url"],
+        isAnonymous: false,
+      });
+      return user;
+    }
+  }
+
+  // Create new authenticated user (no anonymous account to merge)
+  user = await prisma.user.create({
+    data: {
+      authProvider: "replit",
+      authExternalId,
+      email: claims["email"],
+      displayName:
+        `${claims["first_name"] || ""} ${claims["last_name"] || ""}`.trim() ||
+        null,
+      avatarUrl: claims["profile_image_url"],
+      isAnonymous: false,
+    },
+  });
+
+  return user;
+}
+
+export async function setupAuth(app) {
+  app.set("trust proxy", 1);
+  app.use(getSession());
+  app.use(passport.initialize());
+  app.use(passport.session());
+
+  const config = await getOidcConfig();
+
+  const verify = async (req, tokenSet, verified) => {
+    try {
+      const user = {};
+      updateUserSession(user, tokenSet);
+
+      const anonymousUserId = req.session?.anonymousUserId;
+      const dbUser = await upsertAuthenticatedUser(
+        tokenSet.claims(),
+        anonymousUserId
+      );
+
+      user.dbUserId = dbUser.id;
+      user.dbUser = dbUser;
+
+      if (req.session) {
+        delete req.session.anonymousUserId;
+      }
+
+      verified(null, user);
+    } catch (error) {
+      verified(error);
+    }
+  };
+
+  // Setup passport strategies for each domain
+  const domains = envConfig.replitDomains?.split(",") || ["localhost"];
+  for (const domain of domains) {
+    const hostOnly = domain.split(":")[0]; // <- ensures name matches req.hostname
+
+    const strategy = new Strategy(
+      {
+        name: `replitauth:${hostOnly}`,
+        config,
+        scope: "openid email profile",
+        callbackURL: `${
+          hostOnly === "localhost" ? "http" : "https"
+        }://${domain}/api/callback`,
+        passReqToCallback: true,
+      },
+      verify
+    );
+    passport.use(strategy);
+  }
+
+  passport.serializeUser((user, cb) => cb(null, user));
+  passport.deserializeUser((user, cb) => cb(null, user));
+
+  // Login route
+  app.get("/api/login", (req, res, next) => {
+    const hostOnly = (req.headers.host || "").split(":")[0]; // drop port
+    if (req.session) {
+      req.session.returnTo = resolveFrontendRedirect(req);
+      req.session.authMode = req.query.mode === "signup" ? "signup" : "login";
+    }
+    const authMode = req.query.mode === "signup" ? "signup" : "login";
+    const authOptions = {
+      scope: ["openid", "email", "profile"],
+      prompt:
+        authMode === "signup" ? "consent select_account" : "login consent",
+    };
+
+    if (authMode === "signup") {
+      authOptions.screen_hint = "signup";
+    }
+
+    passport.authenticate(`replitauth:${hostOnly}`, {
+      ...authOptions,
+    })(req, res, next);
+  });
+
+  // OAuth callback
+  app.get("/api/callback", (req, res, next) => {
+    const hostOnly = (req.headers.host || "").split(":")[0]; // drop port
+    passport.authenticate(`replitauth:${hostOnly}`, {
+      successReturnToOrRedirect: DEFAULT_FRONTEND_URL,
+      failureRedirect: DEFAULT_FRONTEND_URL,
+    })(req, res, next);
+  });
+
+  // Logout route
+  app.get("/api/logout", (req, res) => {
+    const redirectTarget = resolveFrontendRedirect(req);
+
+    req.logout(() => {
+      const endSession = config.metadata?.end_session_endpoint;
+
+      if (endSession) {
+        const url = client.buildEndSessionUrl(config, {
+          client_id: envConfig.replId,
+          post_logout_redirect_uri: redirectTarget,
+        });
+        return res.redirect(url.href);
+      }
+
+      return res.redirect(redirectTarget);
+    });
+  });
+}
+
+// Middleware to check if user is authenticated (optional - doesn't block anonymous)
+export const isAuthenticated = async (req, res, next) => {
+  const user = req.user;
+
+  if (!req.isAuthenticated() || !user?.expires_at) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (now <= user.expires_at) {
+    return next();
+  }
+
+  // Try to refresh the token
+  const refreshToken = user.refresh_token;
+  if (!refreshToken) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  try {
+    const config = await getOidcConfig();
+    const tokenResponse = await client.refreshTokenGrant(config, refreshToken);
+    updateUserSession(user, tokenResponse);
+    return next();
+  } catch (error) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+};
+
+// Get user ID from request (supports both anonymous and authenticated)
+export function getUserIdFromRequest(req) {
+  // Check if authenticated user
+  if (req.user?.dbUserId) {
+    return req.user.dbUserId;
+  }
+
+  // Check for anonymous session
+  if (req.session?.anonymousUserId) {
+    return req.session.anonymousUserId;
+  }
+  return null;
+}
+
+// Socket authentication - verify session from socket handshake
+export function authenticateSocket(socket, next) {
+  try {
+    const sessionStore = sessionStoreRef;
+    if (!sessionStore) {
+      // No session store available - allow anonymous connection
+      socket.userId = null;
+      socket.isAuthenticated = false;
+      return next();
+    }
+
+    const req = socket.request;
+    const cookies = req.headers.cookie;
+
+    if (!cookies) {
+      // No cookies - allow anonymous connection
+      socket.userId = null;
+      socket.isAuthenticated = false;
+      return next();
+    }
+
+    // Extract session ID from cookie
+    const sessionCookie = cookies
+      .split(";")
+      .find((c) => c.trim().startsWith("connect.sid="));
+
+    if (!sessionCookie) {
+      // No session cookie - allow anonymous connection
+      socket.userId = null;
+      socket.isAuthenticated = false;
+      return next();
+    }
+
+    // Parse session ID (format: connect.sid=s%3A<sessionId>.<signature>)
+    // Also handle unencoded format: connect.sid=<sessionId>.<signature>
+    let sessionId = null;
+    const encodedMatch = sessionCookie.match(/connect\.sid=s%3A([^.]+)/);
+    const unencodedMatch = sessionCookie.match(/connect\.sid=([^.]+)/);
+    
+    if (encodedMatch) {
+      sessionId = encodedMatch[1];
+    } else if (unencodedMatch) {
+      sessionId = unencodedMatch[1];
+    }
+
+    if (!sessionId) {
+      socket.userId = null;
+      socket.isAuthenticated = false;
+      return next();
+    }
+
+    // Get session from store
+    sessionStore.get(sessionId, async (err, sessionData) => {
+      if (err || !sessionData) {
+        // Invalid session - allow anonymous connection
+        socket.userId = null;
+        socket.isAuthenticated = false;
+        return next();
+      }
+
+      // Check for authenticated user (Passport stores user in session.passport.user)
+      if (sessionData.passport?.user?.dbUserId) {
+        socket.userId = sessionData.passport.user.dbUserId;
+        socket.isAuthenticated = true;
+        socket.user = sessionData.passport.user;
+      } else if (sessionData.anonymousUserId) {
+        // Anonymous user
+        socket.userId = sessionData.anonymousUserId;
+        socket.isAuthenticated = false;
+      } else {
+        // No user in session
+        socket.userId = null;
+        socket.isAuthenticated = false;
+      }
+
+      return next();
+    });
+  } catch (error) {
+    // On error, allow anonymous connection (fail open for better UX)
+    socket.userId = null;
+    socket.isAuthenticated = false;
+    return next();
+  }
+}
