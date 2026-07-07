@@ -265,6 +265,17 @@ export { app };
 
 // ---------- CORS ----------
 // Build a set of allowed origins from config + dev defaults.
+//
+// BASE_URL may be a single URL or a comma-separated list of URLs (the local
+// .env uses the comma-separated form for convenience).  splitList handles
+// both by splitting on commas before URL-parsing each entry individually.
+const rawBaseUrls = config.baseUrl
+  ? config.baseUrl
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+  : ["http://localhost:5000"];
+
 const allowedOrigins = new Set(
   [
     ...(config.isProduction
@@ -275,7 +286,7 @@ const allowedOrigins = new Set(
           "http://localhost:5173",
           "http://127.0.0.1:5173",
         ]),
-    config.baseUrl,
+    ...rawBaseUrls,
     ...config.corsAllowedOrigins,
   ]
     .map((v) => {
@@ -287,6 +298,21 @@ const allowedOrigins = new Set(
     })
     .filter(Boolean),
 );
+
+/**
+ * Filter a set of origin strings to only those that are safe to embed
+ * directly in a Helmet v8 Content-Security-Policy directive value.
+ *
+ * Helmet v8 rejects any directive value that contains "," or ";", and
+ * throws at app startup (not at request time).  Origins derived from
+ * environment variables must be screened before being spread into a
+ * directive array to avoid a boot-time crash.
+ */
+function cspSafeOrigins(originSet) {
+  return [...originSet].filter(
+    (v) => typeof v === "string" && v.length > 0 && !/[,;]/.test(v),
+  );
+}
 
 const allowedSuffixes = config.corsAllowedOriginSuffixes.map((s) =>
   s.toLowerCase().replace(/^\*\./, "").replace(/^\./, ""),
@@ -323,6 +349,8 @@ app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
 // ---------- Security headers ----------
+// cspSafeOrigins() strips any origin that contains "," or ";" before it
+// reaches Helmet v8, which throws at startup if such characters are present.
 app.use(
   helmet({
     contentSecurityPolicy: config.isProduction
@@ -331,7 +359,7 @@ app.use(
             defaultSrc: ["'self'"],
             connectSrc: [
               "'self'",
-              ...allowedOrigins,
+              ...cspSafeOrigins(allowedOrigins),
               "https://pagead2.googlesyndication.com",
               "https://*.google.com",
               "https://*.googlesyndication.com",
