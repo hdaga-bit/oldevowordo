@@ -1839,6 +1839,7 @@ async function closeSharedRoomDueToPartnerLeave(roomId) {
     clearPendingDisconnect(roomId, pid);
   }
   await deleteRoom(roomId);
+  notifyLobbyRoomsUpdated();
 }
 
 function clearDuelRoomCloseTimer(roomId) {
@@ -1875,6 +1876,7 @@ async function closeDuelRoomDueToPartnerLeave(roomId) {
     clearPendingDisconnect(roomId, pid);
   }
   await deleteRoom(roomId);
+  notifyLobbyRoomsUpdated();
 }
 
 function clearBattleHostLeaveTimer(roomId) {
@@ -1922,6 +1924,7 @@ async function closeAbandonedRoomIfEmpty(roomId) {
     clearPendingDisconnect(roomId, pid);
   }
   await deleteRoom(roomId);
+  notifyLobbyRoomsUpdated();
 }
 
 function scheduleAbandonedCloseIfEmpty(room) {
@@ -1962,6 +1965,7 @@ async function closeBattleRoomDueToHostLeave(roomId) {
     clearPendingDisconnect(roomId, pid);
   }
   await deleteRoom(roomId);
+  notifyLobbyRoomsUpdated();
 }
 
 async function maybeHandleBattleHostLeft(room, leftPlayerId) {
@@ -2407,6 +2411,15 @@ const io = new Server(httpServer, {
 });
 ioRef = io;
 
+/** Lobby clients poll /api/rooms/open; also push a lightweight signal so the home page can refetch immediately. */
+function notifyLobbyRoomsUpdated() {
+  try {
+    io.emit("roomsUpdated", { at: Date.now() });
+  } catch (err) {
+    console.warn("[lobby] roomsUpdated emit failed", err?.message || err);
+  }
+}
+
 async function broadcastRoomState(room) {
   io.to(room.id).emit("roomState", sanitizeRoom(room));
   void saveRoom(room).catch((err) => {
@@ -2602,6 +2615,7 @@ io.on("connection", (socket) => {
     }
     cb?.({ roomId: id });
     await broadcastRoomState(room);
+    notifyLobbyRoomsUpdated();
   });
 
   socket.on("joinRoom", async ({ name, roomId, playerId }, cb) => {
@@ -3451,6 +3465,7 @@ const roomCleanupInterval =
           clearDuelRoomCloseTimer(roomId);
           clearBattleHostLeaveTimer(roomId);
           io.to(roomId).emit("roomClosed", { reason: "abandoned", roomId });
+          notifyLobbyRoomsUpdated();
         },
       })
     : null;
