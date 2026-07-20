@@ -1,5 +1,5 @@
 /** Grace period before closing the room after an opponent leaves post-game (ms). */
-export const DUEL_PARTNER_LEAVE_CLOSE_MS = 20 * 1000;
+export const DUEL_PARTNER_LEAVE_CLOSE_MS = 10 * 1000;
 
 function resetRoundFlags(room) {
   room.winner = null;

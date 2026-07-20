@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { socket } from "../socket";
 
-const CLOSE_MS = 20_000;
+const CLOSE_MS = 10_000;
 
 function secondsUntil(closingAt) {
   if (!closingAt) return 0;
